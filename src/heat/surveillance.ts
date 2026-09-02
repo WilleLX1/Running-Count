@@ -120,7 +120,7 @@ export class Surveillance {
     const maxBet = bets.length ? Math.max(...bets) : 0;
     const minPlayed = bets.length ? Math.min(...bets) : rules.minBet;
     const spread = minPlayed > 0 ? maxBet / minPlayed : 1;
-    b.spread = clamp((spread - 2.5) / 9, 0, 1) * scrutiny;
+    b.spread = clamp((spread - 2) / 6, 0, 1) * scrutiny;
 
     // 2. The one that really gets you barred: does bet size track the count?
     if (played.length >= 8) {
@@ -163,11 +163,14 @@ export class Surveillance {
     b.tells = Math.max(0, b.tells - 0.005);
 
     // Correlation dominates on purpose: the pit does not need to know Hi-Lo,
-    // only that the money goes up when the shoe is good. Weights are tuned in
-    // scripts/simulate.ts -- see `npm run sim -- heat`.
+    // only that the money goes up when the shoe is good. How loudly that reads
+    // depends on how far the money actually moves, so the spread scales it --
+    // which is what makes a smaller ramp buy you more hands. Weights are tuned
+    // in scripts/simulate.ts -- see `npm run sim -- heat`.
+    const loudness = clamp(spread / 8, 0.35, 1.4);
     const perRound =
-      b.spread * 1.9 +
-      b.correlation * 6.8 +
+      b.spread * 3.0 +
+      b.correlation * 5.5 * loudness +
       b.jump * 1.5 +
       b.winRate * 2.0 +
       b.wonging * 2.6 +
@@ -194,19 +197,55 @@ export class Surveillance {
 
   /** Heat the player can actually perceive: body language, not a number. */
   tellText(): string {
-    switch (this.attention) {
-      case "clear":
-        return "The pit is chatting about football.";
-      case "noticed":
-        return "The dealer keeps glancing at your chip tray.";
-      case "watching":
-        return "A floor supervisor drifted over and is not leaving.";
-      case "pit":
-        return "The pit boss is reading your play back to someone upstairs.";
-      case "backoff":
-        return "Two suits are walking toward your table.";
-      case "barred":
-        return "Security has your photograph.";
-    }
+    return attentionTell(this.attention);
   }
 }
+
+/** What the pit looks like at each level. Works off a snapshot too. */
+export function attentionTell(a: Attention): string {
+  switch (a) {
+    case "clear":
+      return "The pit is chatting about football.";
+    case "noticed":
+      return "The dealer keeps glancing at your chip tray.";
+    case "watching":
+      return "A floor supervisor drifted over and is not leaving.";
+    case "pit":
+      return "The pit boss is reading your play back to someone upstairs.";
+    case "backoff":
+      return "Two suits are walking toward your table.";
+    case "barred":
+      return "Security has your photograph.";
+  }
+}
+
+/** Short form for a teammate's status line. */
+export function attentionShort(a: Attention): string {
+  switch (a) {
+    case "clear":
+      return "clean";
+    case "noticed":
+      return "noticed";
+    case "watching":
+      return "watched";
+    case "pit":
+      return "pit is on them";
+    case "backoff":
+      return "being backed off";
+    case "barred":
+      return "barred";
+  }
+}
+
+/** The heat fields any screen needs, from a live model or a snapshot. */
+export interface HeatView {
+  suspicion: number;
+  attention: Attention;
+  breakdown: HeatBreakdown;
+}
+
+export const CLEAR_HEAT: HeatView = {
+  suspicion: 0,
+  attention: "clear",
+  breakdown: { spread: 0, correlation: 0, jump: 0, winRate: 0, wonging: 0, tells: 0 },
+};

@@ -6,6 +6,7 @@ import { money } from "../core/math";
 import { FloorScene } from "./floor";
 import { TrainerScene } from "./trainer";
 import { PrimerScene } from "./primer";
+import { LobbyScene } from "./lobby";
 
 const STAKES: { label: string; bankroll: number; unit: number }[] = [
   { label: "Tourist", bankroll: 1000, unit: 10 },
@@ -128,24 +129,28 @@ export class MenuScene implements Scene {
       this.game.setScene(floor);
       return;
     }
-    const trainR = { x: 664, y: 552, w: 240, h: 62 };
+    const coopR = { x: 120, y: 626, w: 520, h: 54 };
+    if (button(f, coopR, "Play co-op with friends", { accent: C.gold, hotkey: "C" }) || f.input.consume("c")) {
+      this.game.setScene(new LobbyScene(this.game));
+      return;
+    }
+    const trainR = { x: 664, y: 552, w: 496, h: 62 };
     if (button(f, trainR, "Training room", { accent: C.blue, hotkey: "T" }) || f.input.consume("t")) {
       this.game.setScene(new TrainerScene(this.game, () => this.game.setScene(new MenuScene(this.game))));
       return;
     }
-    const howR = { x: 920, y: 552, w: 240, h: 62 };
+    const howR = { x: 664, y: 626, w: 496, h: 54 };
     if (button(f, howR, "How counting works", { accent: C.purple, hotkey: "H" }) || f.input.consume("h")) {
       this.game.setScene(new PrimerScene(this.game, () => this.game.setScene(new MenuScene(this.game))));
       return;
     }
 
-    fillRound(f.ctx, { x: 120, y: 640, w: 1040, h: 40 }, 8, "rgba(20,28,36,0.6)", C.line);
     text(
       ctx,
       "WASD / arrows to walk · E to interact · this is a simulation, not gambling advice",
       VW / 2,
-      661,
-      { size: 13, color: C.faint, align: "center", baseline: "middle" },
+      700,
+      { size: 12, color: C.faint, align: "center", baseline: "middle" },
     );
 
     vignette(ctx, VW, VH, 0.45);

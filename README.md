@@ -62,6 +62,7 @@ tray, true-count conversion, basic strategy, and the Illustrious 18 index plays.
 | `W` | sit the hand out (wong) |
 | `T` | tip the dealer |
 | `+` / `-` | adjust your own running count (Spotter mode) |
+| `C` / `Q` | co-op: call the count / open the callouts |
 | `ESC` | stand up / back |
 
 ## Verifying the maths
@@ -74,6 +75,7 @@ npm run sim -- edge     # expected value by playing style
 npm run sim -- heat     # how long each style lasts before a back-off
 npm run sim -- diag     # outcome frequencies vs the textbook
 npm run sim -- audit    # settlement arithmetic, hand by hand
+npm run sim -- coop     # a real Room: a big player and a spotter on one shoe
 ```
 
 Over 600,000 hands on the 6-deck S17 3:2 table:
@@ -90,12 +92,14 @@ And how long each lasts before being backed off (5 runs each):
 | Style | $10 table | High limit |
 | --- | --- | --- |
 | Flat bettor | never | never |
-| 1-6 spread | ~113 bets | ~52 bets |
-| 1-12 spread | ~74 bets | ~50 bets |
-| Back-counter | ~18 bets | ~17 bets |
+| 1-6 spread | ~110 bets | ~55 bets |
+| 1-12 spread | ~66 bets | ~50 bets |
+| Back-counter | ~18 bets | ~20 bets |
 
-That gap between the 1-6 and 1-12 spread is the game: the bigger ramp earns more
-per hand and buys you far fewer hands.
+That gap is the game. The 1-12 spread earns 1.4× as much per hand as the 1-6
+spread and buys you 1.7× fewer hands before you are asked to leave, so the
+greedier ramp actually makes less money per session. Back-counting earns the most
+per hand of anything and gets you thrown out fastest.
 
 ## Layout
 
@@ -105,8 +109,11 @@ src/
   blackjack/   cards, shoe, hand, rules, Hi-Lo counting, basic strategy + Illustrious 18, TableSim
   heat/        the surveillance model
   world/       casino floor: collision, tables, features, wandering crowd
-  scenes/      menu, primer, floor, table, trainer, results
+  net/         wire protocol, snapshot serialisation, WebSocket client
+  table/       the controller seam: LocalTable (solo) and RemoteTable (co-op)
+  scenes/      menu, lobby, primer, floor, table, trainer, results, signals
   state/       session, bankroll, stats
+server/        room, hub, Vite dev plugin, standalone host
 scripts/       headless simulation harness
 ```
 
@@ -117,21 +124,64 @@ broadcast its state.
 
 ## Co-op
 
-The table is already modelled as N seats, each with its own hands, bets and
-insurance, and NPCs drive the seats you are not in. Turning that into networked
-co-op means:
+Two to four counters in one casino, on one shoe, with **one pit watching all of
+you separately**. Menu → *Play co-op with friends* → host a table and pass the
+four letter code around, or type someone else's code to join. `npm run dev` is
+all anyone needs: the room server rides along inside the Vite dev server.
 
-1. Replace the single `playerSeat` / `pendingBet` / `betLocked` / `sittingOut`
-   fields with per-seat versions — the rest of the state machine already iterates
-   seats and does not care who is behind one.
-2. Run `TableSim` on a Node process with the shoe's seed as the authority, and
-   send `{seat, action}` messages up, snapshots down.
-3. Reuse `SimHooks` as the broadcast points; every visible change already flows
-   through them.
+Everyone walks the same floor and can sit at the same table. Seats are dealt in
+order, so you act in turn, and the dealer keeps a clock: 20 seconds to get a bet
+out, 30 to make a decision. Sit down at a table a teammate is already working and
+the pit will move an NPC along to make room.
 
-The heat model is per-player and would stay client-visible but server-owned, which
-is what makes a co-op team interesting: one player spreads while the other flat
-bets and calls the count.
+**Why play together.** Heat is tracked per person, and it is built almost entirely
+out of how *your* bets track the count. So the classic team shape works exactly as
+it should: one player flat bets the minimum, counts, and stays invisible; the
+other sits down cold and pushes out eight units on a signal. The spotter's heat
+never moves. The big player takes all of it — and when they get backed off, the
+rest of the team keeps playing.
+
+**Talking without talking.** `C` calls the count — you type in the number *you*
+believe, not the one the game knows, so a bad count travels down the table like a
+real one. `Q` opens the callouts: shoe is hot, shoe is cold, cut card is close,
+heat is on me, open seat here, colouring up. The team panel shows every
+teammate's name, the last few calls, and how the pit is reading each of them.
+
+**When someone drops**, their seat and chips are held for 45 seconds so they can
+come back. Stand up with cards already out and you cannot pull the bet back — the
+dealer finishes your hand by the book and pays it to your account. Rooms clean
+themselves up ten minutes after the last person leaves.
+
+`npm run sim -- coop` runs the real server headlessly with two scripted players
+on one shoe, which is where the team shape shows up plainly:
+
+```
+Ana     40 hands  peak heat  95  spread 0.55  correlation 0.55   BACKED OFF after 40 rounds
+Bo     259 hands  peak heat   0  spread 0.00  correlation 0.00   still playing
+```
+
+To host for people outside your machine, build once and run the standalone
+server, which serves the client and the rooms on one port:
+
+```bash
+npm run build && npm run serve
+```
+
+### How it is wired
+
+- `TableSim` runs **only on the server**. It is the same class solo play uses,
+  with seats that hold either humans or NPCs.
+- The client sends intents (`bet`, `deal`, `act`, `insurance`, `sit`, `signal`)
+  and renders whatever comes back. It never decides an outcome.
+- Snapshots go out at 15 Hz: full detail for tables somebody is sitting at, a
+  one-line summary for the rest, plus every player's position, bankroll and heat.
+- The dealer's hole card is **not sent** until it is turned over, so the card is
+  not in the client's memory to be read.
+- Positions on the floor are client-reported, because nothing is at stake in
+  where somebody is standing.
+- `src/table/controller.ts` is the seam: `LocalTable` wraps a local `TableSim`,
+  `RemoteTable` wraps the socket, and the table scene talks only to the interface.
+  That is why solo and co-op look and behave identically.
 
 ## Notes
 

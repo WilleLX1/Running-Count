@@ -1,11 +1,14 @@
 /**
- * Headless checks for the blackjack engine and the surveillance model.
+ * Headless checks for the blackjack engine, the surveillance model and the
+ * co-op server. All of it drives the same code the game runs, without a
+ * renderer, a browser or a socket.
  *
- *   npm run sim              -- everything
- *   npm run sim -- edge      -- expected value only
- *   npm run sim -- heat      -- how long different players last
- *
- * The engine here is exactly the one the game runs, driven without a renderer.
+ *   npm run sim              -- expected value and surveillance
+ *   npm run sim -- edge      -- expected value by playing style
+ *   npm run sim -- heat      -- how long each style lasts before a back-off
+ *   npm run sim -- diag      -- outcome frequencies against the textbook
+ *   npm run sim -- audit     -- settlement arithmetic, hand by hand
+ *   npm run sim -- coop      -- a real Room with a big player and a spotter
  */
 import { TableSim, type PlayerAccount, type RoundSummary } from "../src/blackjack/sim";
 import { TABLE_PRESETS, houseEdge, type TableRules } from "../src/blackjack/rules";
@@ -14,10 +17,21 @@ import { correctAction } from "../src/blackjack/strategy";
 import { floorTrueCount, recommendedBet } from "../src/blackjack/counting";
 import { Surveillance } from "../src/heat/surveillance";
 import { mulberry32 } from "../src/core/rng";
+import { Room, type Conn } from "../server/room";
+import type { ServerMessage } from "../src/net/protocol";
 
 // Larger than any timer in the sim, so each update advances one step. The
 // game logic is identical; it just runs about fifteen times faster.
 const DT = 0.6;
+
+/** The measured player's seat id. */
+const ME = "counter";
+
+function mySeat(sim: TableSim) {
+  const seat = sim.seatOf(ME);
+  if (!seat) throw new Error("the measured player is not seated");
+  return seat;
+}
 
 interface PlayerPolicy {
   name: string;
@@ -77,7 +91,7 @@ function run(
   let roundsUntilBackoff: number | null = null;
   let peakHeat = 0;
 
-  const sim = new TableSim(rules, rng, account, {
+  const sim = new TableSim(rules, rng, {
     onRoundEnd: (s) => {
       summaries.push(s);
       if (withHeat) {
@@ -110,35 +124,38 @@ function run(
       s.hands = [];
     }
   });
-  sim.sit(0);
+  sim.sit(0, { playerId: ME, name: "Counter", account });
 
-  let played = 0;
   let guard = 0;
   const start = account.bankroll;
   let wagered = 0;
 
-  while (played < rounds && guard++ < rounds * 4000) {
-    if (sim.phase === "betting" && !sim.betLocked) {
+  // One decision per betting window, not per frame: the table sits in the
+  // betting phase for several ticks while it waits.
+  let decidedFor = -1;
+  while (summaries.length < rounds && guard++ < rounds * 4000) {
+    if (sim.phase === "betting" && !mySeat(sim).betLocked && decidedFor !== sim.round) {
+      decidedFor = sim.round;
       const tc = floorTrueCount(sim.trueCount);
       const bet = policy.bet(tc, rules, unit);
       if (bet <= 0) {
-        sim.setSittingOut(true);
+        sim.setSittingOut(ME, true);
       } else {
-        sim.setBet(bet);
-        sim.confirmBet();
+        sim.setSittingOut(ME, false);
+        sim.setBet(ME, bet);
+        sim.confirmBet(ME);
         wagered += bet;
       }
-      played++;
     }
 
-    if (sim.offeringInsurance) {
+    if (sim.offeringInsuranceTo(ME)) {
       const tc = floorTrueCount(sim.trueCount);
-      sim.answerInsurance(policy.useDeviations && tc >= 3);
+      sim.answerInsurance(ME, policy.useDeviations && tc >= 3);
     }
 
-    const turn = sim.playerTurn();
+    const turn = sim.turnOf(ME);
     if (turn) {
-      const seat = sim.seat!;
+      const seat = mySeat(sim);
       const legal = legalActions(turn.hand, seat.hands.length, rules, account.bankroll);
       const { action } = correctAction(
         turn.hand,
@@ -148,7 +165,7 @@ function run(
         floorTrueCount(sim.trueCount),
         policy.useDeviations,
       );
-      sim.act(action);
+      sim.act(ME, action);
     }
 
     if (withHeat) heat.update(DT, true);
@@ -235,7 +252,7 @@ function diagReport(): void {
   let doubles = 0;
   let splits = 0;
 
-  const sim = new TableSim(rules, rng, account, {
+  const sim = new TableSim(rules, rng, {
     onRoundEnd: (s) => {
       for (const r of s.results) {
         tally[r] = (tally[r] ?? 0) + 1;
@@ -253,25 +270,25 @@ function diagReport(): void {
       s.npc = { skill: 0.95, aggression: 1, superstition: 0 };
     }
   });
-  sim.sit(0);
+  sim.sit(0, { playerId: ME, name: "Counter", account });
 
   let lastRound = 0;
   let guard = 0;
   const target = 120000;
   while (hands < target && guard++ < target * 400) {
-    if (sim.phase === "betting" && !sim.betLocked) {
-      sim.setBet(rules.minBet);
-      sim.confirmBet();
+    if (sim.phase === "betting" && !mySeat(sim).betLocked) {
+      sim.setBet(ME, rules.minBet);
+      sim.confirmBet(ME);
     }
-    if (sim.offeringInsurance) sim.answerInsurance(false);
-    const turn = sim.playerTurn();
+    if (sim.offeringInsuranceTo(ME)) sim.answerInsurance(ME, false);
+    const turn = sim.turnOf(ME);
     if (turn) {
-      const seat = sim.seat!;
+      const seat = mySeat(sim);
       const legal = legalActions(turn.hand, seat.hands.length, rules, account.bankroll);
       const { action } = correctAction(turn.hand, sim.dealerUpcard!, rules, legal, 0, false);
       if (action === "double") doubles++;
       if (action === "split") splits++;
-      sim.act(action);
+      sim.act(ME, action);
     }
     if (sim.phase === "settle" && sim.round !== lastRound) {
       lastRound = sim.round;
@@ -283,7 +300,7 @@ function diagReport(): void {
       const dt = dealerTotal(sim);
       if (dt > 21) dealerBust++;
       if (sim.dealer.cards.length === 2 && dt === 21) dealerBJ++;
-      const ph = sim.seat!.hands[0];
+      const ph = mySeat(sim).hands[0];
       if (ph && ph.cards.length === 2 && !ph.fromSplit && handValue(ph.cards) === 21) playerBJ++;
     }
     sim.update(DT);
@@ -313,6 +330,10 @@ function diagReport(): void {
 
 function dealerTotal(sim: TableSim): number {
   return handValue(sim.dealer.cards);
+}
+
+function dealerHadBlackjack(sim: TableSim): boolean {
+  return sim.dealer.cards.length === 2 && handValue(sim.dealer.cards) === 21;
 }
 
 function handValue(cards: { rank: string }[]): number {
@@ -345,7 +366,7 @@ function auditReport(): void {
   let bankrollBefore = account.bankroll;
   let staked = 0;
 
-  const sim = new TableSim(rules, rng, account, {});
+  const sim = new TableSim(rules, rng, {});
   sim.seats.forEach((s, i) => {
     if (i === 0) s.kind = "empty";
     else {
@@ -355,31 +376,31 @@ function auditReport(): void {
       s.npc = { skill: 0.95, aggression: 1, superstition: 0 };
     }
   });
-  sim.sit(0);
+  sim.sit(0, { playerId: ME, name: "Counter", account });
 
   let phaseWas = sim.phase;
   let guard = 0;
   while (rounds < 40000 && guard++ < 40000 * 400) {
-    if (sim.phase === "betting" && !sim.betLocked) {
+    if (sim.phase === "betting" && !mySeat(sim).betLocked) {
       bankrollBefore = account.bankroll;
       staked = 0;
-      sim.setBet(rules.minBet);
-      sim.confirmBet();
+      sim.setBet(ME, rules.minBet);
+      sim.confirmBet(ME);
     }
-    if (sim.offeringInsurance) sim.answerInsurance(false);
-    const turn = sim.playerTurn();
+    if (sim.offeringInsuranceTo(ME)) sim.answerInsurance(ME, false);
+    const turn = sim.turnOf(ME);
     if (turn) {
-      const seat = sim.seat!;
+      const seat = mySeat(sim);
       const legal = legalActions(turn.hand, seat.hands.length, rules, account.bankroll);
       const { action } = correctAction(turn.hand, sim.dealerUpcard!, rules, legal, 0, false);
-      sim.act(action);
+      sim.act(ME, action);
     }
     sim.update(DT);
 
     // The settle step runs once and then moves the phase on.
     if (phaseWas === "settle" && sim.phase !== "settle") {
       rounds++;
-      const seat = sim.seat!;
+      const seat = mySeat(sim);
       let payouts = 0;
       staked = seat.insurance;
       for (const h of seat.hands) {
@@ -403,7 +424,7 @@ function auditReport(): void {
         byResult[key].n++;
         byResult[key].net += p - bet;
       }
-      payouts += seat.insurance > 0 ? (sim.lastSummary?.net ?? 0) * 0 : 0;
+      if (seat.insurance > 0) payouts += dealerHadBlackjack(sim) ? seat.insurance * 3 : 0;
       const ledger = account.bankroll - bankrollBefore;
       const expectedLedger = payouts - staked;
       if (Math.abs(ledger - expectedLedger) > 1e-6) badLedger++;
@@ -428,8 +449,101 @@ function auditReport(): void {
   );
 }
 
+/**
+ * Drives a real co-op Room with two scripted players at one table: a big player
+ * who ramps off the table minimum, and a spotter who flat bets. Checks that the
+ * shared shoe works and that the pit reads the two of them differently.
+ */
+function coopReport(): void {
+  const room = new Room("TEST", 4242);
+  const sent: Record<string, ServerMessage[]> = { big: [], spotter: [] };
+  const conn = (who: string): Conn => ({
+    send: (m) => sent[who].push(m),
+    close: () => {},
+  });
+
+  const big = room.join(conn("big"), "Ana", 20000, 25);
+  const spotter = room.join(conn("spotter"), "Bo", 20000, 25);
+  const table = room.casino.tables[0];
+  room.handle(big.id, { t: "sit", tableId: table.id });
+  room.handle(spotter.id, { t: "sit", tableId: table.id });
+
+  const seatOf = (p: typeof big) => table.sim.seatOf(p.id);
+  if (!seatOf(big) || !seatOf(spotter)) throw new Error("players failed to sit down");
+
+  const dt = 1 / 30;
+  let rounds = 0;
+  let lastRound = -1;
+  let guard = 0;
+  const rules = table.rules;
+  const peak: Record<string, number> = { big: 0, spotter: 0 };
+  const backedOffAt: Record<string, number | null> = { big: null, spotter: null };
+
+  while (rounds < 260 && guard++ < 400000) {
+    const sim = table.sim;
+    if (sim.phase === "betting" && sim.round !== lastRound) {
+      lastRound = sim.round;
+      rounds++;
+      const tc = floorTrueCount(sim.trueCount);
+      const ramp = tc >= 4 ? 16 : tc >= 3 ? 8 : tc >= 2 ? 4 : tc >= 1 ? 2 : 1;
+      room.handle(big.id, { t: "bet", amount: ramp * rules.minBet });
+      room.handle(big.id, { t: "deal" });
+      room.handle(spotter.id, { t: "bet", amount: rules.minBet });
+      room.handle(spotter.id, { t: "deal" });
+    }
+    for (const p of [big, spotter]) {
+      if (sim.offeringInsuranceTo(p.id)) room.handle(p.id, { t: "insurance", take: false });
+      const turn = sim.turnOf(p.id);
+      if (turn) {
+        const seat = sim.seatOf(p.id)!;
+        const legal = legalActions(turn.hand, seat.hands.length, rules, p.account.bankroll);
+        const { action } = correctAction(
+          turn.hand,
+          sim.dealerUpcard!,
+          rules,
+          legal,
+          floorTrueCount(sim.trueCount),
+          false,
+        );
+        room.handle(p.id, { t: "act", action });
+      }
+    }
+    room.tick(dt);
+    peak.big = Math.max(peak.big, big.heat.suspicion);
+    peak.spotter = Math.max(peak.spotter, spotter.heat.suspicion);
+    if (big.heat.barred && backedOffAt.big === null) backedOffAt.big = rounds;
+    if (spotter.heat.barred && backedOffAt.spotter === null) backedOffAt.spotter = rounds;
+  }
+
+  const snap = room.snapshot();
+  console.log(`\nCO-OP ROOM  --  ${rounds} rounds at ${rules.name}, two humans at one table\n`);
+  console.log(`  seats now: ${table.sim.seats.map((s) => s.kind).join(", ")}`);
+  console.log(`  table view sent to clients: ${snap.tables.length} detailed, ${snap.briefs.length} summarised`);
+  console.log(`  round summaries delivered: big ${sent.big.filter((m) => m.t === "round").length}, spotter ${sent.spotter.filter((m) => m.t === "round").length}\n`);
+  for (const [who, p] of [
+    ["big", big],
+    ["spotter", spotter],
+  ] as const) {
+    const v = snap.players.find((x) => x.id === p.id)!;
+    const hands = sent[who].filter((m) => m.t === "round").length;
+    const fate =
+      backedOffAt[who] !== null ? `BACKED OFF after ${backedOffAt[who]} rounds` : "still playing";
+    console.log(
+      `  ${p.name.padEnd(6)} ${String(hands).padStart(3)} hands  ` +
+        `bankroll ${Math.round(p.account.bankroll).toLocaleString().padStart(7)}  ` +
+        `peak heat ${String(Math.round(peak[who])).padStart(3)}  ` +
+        `spread ${v.breakdown.spread.toFixed(2)}  correlation ${v.breakdown.correlation.toFixed(2)}   ${fate}`,
+    );
+  }
+  console.log(
+    `\n  The spotter never left the table and the pit never looked at them. ` +
+      `That is the point of playing as a team.`,
+  );
+}
+
 const arg = process.argv[2];
 if (arg === "diag") diagReport();
 if (arg === "audit") auditReport();
+if (arg === "coop") coopReport();
 if (!arg || arg === "edge") edgeReport();
 if (!arg || arg === "heat") heatReport();

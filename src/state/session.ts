@@ -1,4 +1,4 @@
-import { Surveillance } from "../heat/surveillance";
+import { Surveillance, type Attention, type HeatBreakdown } from "../heat/surveillance";
 import type { RoundSummary } from "../blackjack/sim";
 import type { Action } from "../blackjack/strategy";
 
@@ -95,6 +95,16 @@ export class Session {
     this.surveillance = new Surveillance();
     this.recentDecisions = [];
     this.playerRunning = 0;
+  }
+
+  /**
+   * In co-op the server owns the heat model; mirror it locally so the HUD and
+   * the end-of-session breakdown read from one place in both modes.
+   */
+  mirrorHeat(view: { suspicion: number; attention: Attention; breakdown: HeatBreakdown }): void {
+    this.surveillance.suspicion = view.suspicion;
+    this.surveillance.attention = view.attention;
+    this.surveillance.breakdown = view.breakdown;
   }
 
   recordRound(s: RoundSummary): void {

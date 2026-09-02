@@ -1,6 +1,6 @@
 import type { Game, Scene } from "../game";
 import { VH, VW } from "../core/renderer";
-import { C, bar, button, fillRound, panel, roundRect, text, vignette, type Frame } from "../core/ui";
+import { C, bar, fillRound, roundRect, text, vignette, type Frame } from "../core/ui";
 import { Casino, WORLD_H, WORLD_W, type CasinoTable, type Interaction } from "../world/casino";
 import { clamp, damp, money } from "../core/math";
 import { mulberry32, randomSeed } from "../core/rng";
@@ -8,6 +8,11 @@ import { rulesSummary } from "../blackjack/rules";
 import { TableScene } from "./table";
 import { TrainerScene } from "./trainer";
 import { ResultsScene } from "./results";
+import { LocalTable, RemoteTable, type TableController } from "../table/controller";
+import type { NetClient } from "../net/client";
+import { attentionTell, CLEAR_HEAT, type HeatView } from "../heat/surveillance";
+import { SignalPanel, drawTeamPanel, heatTint } from "./signals";
+import type { TableBrief } from "../net/protocol";
 
 const PLAYER_SPEED = 175;
 const PLAYER_R = 13;
@@ -19,27 +24,57 @@ export class FloorScene implements Scene {
   player = { x: WORLD_W / 2 - 250, y: WORLD_H - 120, vx: 0, vy: 0, face: 1, step: 0 };
   camX = WORLD_W / 2 - 250;
   camY = WORLD_H - 120;
-  /** Minutes since 20:00. */
+  /** Minutes since 20:00. Server owned in co-op. */
   clock = 0;
   private prompt: Interaction | null = null;
   private carpet: CanvasPattern | null = null;
   private note = "";
   private noteT = 0;
   private suitsT = 0;
+  private signals = new SignalPanel();
+  private sitPending: string | null = null;
 
-  constructor(private game: Game) {
-    const rng = mulberry32(randomSeed());
-    this.casino = new Casino(rng, this.game.session, (table) => ({
-      onRoundEnd: (s) => {
-        if (!table.sim.playerSeated) return;
-        this.game.session.recordRound(s);
-        this.game.session.surveillance.observe(s, table.rules, this.game.session.unit);
-      },
-    }));
+  constructor(
+    private game: Game,
+    public net: NetClient | null = null,
+  ) {
+    const rng = mulberry32(net ? net.seed : randomSeed());
+    if (net) {
+      // The server owns every shoe in a co-op room; this copy is scenery.
+      this.casino = new Casino(rng);
+      const me = net.me;
+      if (me) {
+        this.player.x = me.x;
+        this.player.y = me.y;
+        this.camX = me.x;
+        this.camY = me.y;
+      }
+    } else {
+      this.casino = new Casino(rng, (table) => ({
+        onRoundEnd: (s) => {
+          if (table.sim.humans().length === 0) return;
+          this.game.session.recordRound(s);
+          this.game.session.surveillance.observe(s, table.rules, this.game.session.unit);
+        },
+      }));
+    }
   }
 
   enter(): void {
     this.game.returnScene = this;
+    const net = this.net;
+    if (!net) return;
+    net.events.onEvent = (text) => this.say(text);
+    net.events.onBackoff = () => {
+      this.game.session.stats.backoffs++;
+      this.game.setScene(new ResultsScene(this.game, "backoff"));
+    };
+    net.events.onClosed = () => {
+      this.game.toast("Lost the connection to the table.", C.red);
+      this.game.setScene(new ResultsScene(this.game, "walked"));
+    };
+    net.events.onRound = undefined;
+    net.events.onShuffle = undefined;
   }
 
   /** Called by the table scene when the player stands up. */
@@ -49,6 +84,7 @@ export class FloorScene implements Scene {
   }
 
   advanceClock(minutes: number): void {
+    if (this.net) return; // server owned
     this.clock += minutes;
     for (const t of this.casino.tables) t.awaySeconds += minutes * 60;
   }
@@ -58,27 +94,53 @@ export class FloorScene implements Scene {
     this.noteT = 4;
   }
 
+  private get heat(): HeatView {
+    if (this.net) return this.net.me ?? CLEAR_HEAT;
+    return this.game.session.surveillance;
+  }
+
+  private briefFor(id: string): TableBrief | null {
+    return this.net?.room?.briefs.find((b) => b.id === id) ?? null;
+  }
+
   frame(f: Frame): void {
     const dt = f.dt;
     const session = this.game.session;
-    this.clock += dt * TIME_SCALE;
+    const net = this.net;
+
+    if (net) {
+      this.clock = net.room?.clock ?? this.clock;
+      const me = net.me;
+      if (me) {
+        session.bankroll = me.bankroll;
+        session.mirrorHeat(me);
+      }
+    } else {
+      this.clock += dt * TIME_SCALE;
+      session.surveillance.update(dt, false);
+      for (const t of this.casino.tables) {
+        // A hand you walked away from still has to be played out and paid.
+        if (t.sim.humans().length > 0) t.sim.update(dt);
+        else t.awaySeconds += dt;
+      }
+    }
+
     this.noteT -= dt;
-
-    // ---------------------------------------------------------- simulation
     session.stats.timePlayed += dt;
-    session.surveillance.update(dt, false);
     this.casino.updateNpcs(dt);
-    for (const t of this.casino.tables) t.awaySeconds += dt;
 
+    // ------------------------------------------------------------ movement
+    const modal = net !== null && this.signals.frame(f, net, session, null);
     let dx = 0;
     let dy = 0;
-    if (f.input.isDown("a", "arrowleft")) dx -= 1;
-    if (f.input.isDown("d", "arrowright")) dx += 1;
-    if (f.input.isDown("w", "arrowup")) dy -= 1;
-    if (f.input.isDown("s", "arrowdown")) dy += 1;
+    if (!modal) {
+      if (f.input.isDown("a", "arrowleft")) dx -= 1;
+      if (f.input.isDown("d", "arrowright")) dx += 1;
+      if (f.input.isDown("w", "arrowup")) dy -= 1;
+      if (f.input.isDown("s", "arrowdown")) dy += 1;
+    }
     const len = Math.hypot(dx, dy) || 1;
-    const moving = dx !== 0 || dy !== 0;
-    if (moving) {
+    if (dx !== 0 || dy !== 0) {
       const sp = PLAYER_SPEED * dt;
       const moved = this.casino.moveCircle(
         this.player.x,
@@ -92,38 +154,54 @@ export class FloorScene implements Scene {
       this.player.step += dt * 9;
       if (dx !== 0) this.player.face = Math.sign(dx);
     }
+    net?.reportPosition(this.player.x, this.player.y, dt);
 
     this.camX = damp(this.camX, clamp(this.player.x, VW / 2, WORLD_W - VW / 2), 8, dt);
     this.camY = damp(this.camY, clamp(this.player.y, VH / 2, WORLD_H - VH / 2), 8, dt);
-
     this.prompt = this.casino.nearestInteraction(this.player.x, this.player.y);
 
-    // Pit boss drifts toward the player as heat climbs.
-    const heat = session.surveillance.suspicion;
+    // The pit boss drifts toward whoever is hottest.
+    const heat = this.heat;
     const pb = this.casino.pitBoss;
-    if (heat > 40) {
-      pb.tx = this.player.x;
-      pb.ty = this.player.y - 90;
+    const hottest = net ? this.hottestPlayer() : { x: this.player.x, y: this.player.y, suspicion: heat.suspicion };
+    if (hottest.suspicion > 40) {
+      pb.tx = hottest.x;
+      pb.ty = hottest.y - 90;
     } else {
       pb.tx = WORLD_W / 2;
       pb.ty = 340;
     }
-    pb.x = damp(pb.x, pb.tx, heat > 40 ? 0.9 : 0.4, dt);
-    pb.y = damp(pb.y, pb.ty, heat > 40 ? 0.9 : 0.4, dt);
+    pb.x = damp(pb.x, pb.tx, hottest.suspicion > 40 ? 0.9 : 0.4, dt);
+    pb.y = damp(pb.y, pb.ty, hottest.suspicion > 40 ? 0.9 : 0.4, dt);
 
-    if (session.surveillance.backoffPending) {
-      this.suitsT += dt;
-      if (this.suitsT > 6) {
-        session.surveillance.backoffPending = false;
-        session.stats.backoffs++;
-        this.game.setScene(new ResultsScene(this.game, "backoff"));
+    // -------------------------------------------------------- transitions
+    if (net) {
+      const me = net.me;
+      if (me?.tableId && this.sitPending === me.tableId) {
+        const table = this.casino.tables.find((t) => t.id === me.tableId);
+        if (table) {
+          this.sitPending = null;
+          this.game.setScene(
+            new TableScene(this.game, this, table, new RemoteTable(table.id, net, table.rules)),
+          );
+          return;
+        }
+      }
+      if (me && me.backoffIn >= 0) this.suitsT = me.backoffIn;
+    } else {
+      if (session.surveillance.backoffPending) {
+        this.suitsT += dt;
+        if (this.suitsT > 6) {
+          session.surveillance.backoffPending = false;
+          session.stats.backoffs++;
+          this.game.setScene(new ResultsScene(this.game, "backoff"));
+          return;
+        }
+      }
+      if (session.bankroll < 5) {
+        this.game.setScene(new ResultsScene(this.game, "broke"));
         return;
       }
-    }
-
-    if (session.bankroll < 5) {
-      this.game.setScene(new ResultsScene(this.game, "broke"));
-      return;
     }
 
     // ------------------------------------------------------------- render
@@ -134,12 +212,22 @@ export class FloorScene implements Scene {
     this.drawFeatures(f);
     for (const t of this.casino.tables) this.drawTable(f, t);
     this.drawCrowd(f);
+    this.drawTeammates(f);
     this.drawPlayer(f);
     ctx.restore();
 
     vignette(ctx, VW, VH, 0.55);
     this.drawHud(f);
-    this.handleInteraction(f);
+    if (!modal) this.handleInteraction(f);
+    if (net) drawTeamPanel(f, net, 16, 96, 300);
+  }
+
+  private hottestPlayer(): { x: number; y: number; suspicion: number } {
+    let best = { x: this.player.x, y: this.player.y, suspicion: 0 };
+    for (const p of this.net?.room?.players ?? []) {
+      if (p.suspicion > best.suspicion) best = { x: p.x, y: p.y, suspicion: p.suspicion };
+    }
+    return best;
   }
 
   // ------------------------------------------------------------- rendering
@@ -149,7 +237,6 @@ export class FloorScene implements Scene {
     if (!this.carpet) this.carpet = makeCarpet(ctx);
     ctx.fillStyle = this.carpet ?? C.carpet;
     ctx.fillRect(0, 0, WORLD_W, WORLD_H);
-    // Warm pools of light under each table.
     for (const t of this.casino.tables) {
       const g = ctx.createRadialGradient(t.x, t.y, 20, t.x, t.y, 260);
       g.addColorStop(0, "rgba(255,214,150,0.14)");
@@ -227,7 +314,6 @@ export class FloorScene implements Scene {
   private drawTable(f: Frame, t: CasinoTable): void {
     const { ctx } = f;
     ctx.save();
-    // Felt.
     ctx.shadowColor = "rgba(0,0,0,0.5)";
     ctx.shadowBlur = 18;
     ctx.shadowOffsetY = 6;
@@ -247,7 +333,6 @@ export class FloorScene implements Scene {
     ctx.lineWidth = 1.5;
     ctx.stroke();
 
-    // Dealer.
     const dy = t.y - t.rh / 2 - 20;
     ctx.beginPath();
     ctx.arc(t.x, dy, 12, 0, Math.PI * 2);
@@ -256,25 +341,29 @@ export class FloorScene implements Scene {
     ctx.fillStyle = "#1b2129";
     ctx.fillRect(t.x - 9, dy + 8, 18, 10);
 
-    // Seats with whoever is in them.
-    const seats = t.sim.seats;
-    seats.forEach((s, i) => {
-      const a = Math.PI * (0.15 + (0.7 * (i + 0.5)) / seats.length);
+    // Seats: authoritative from the server in co-op, from the local sim solo.
+    const brief = this.briefFor(t.id);
+    const kinds = brief ? brief.seats : t.sim.seats.map((s) => s.kind);
+    const humanIds = brief ? brief.humans : [];
+    let humanCursor = 0;
+    kinds.forEach((kind, i) => {
+      const a = Math.PI * (0.15 + (0.7 * (i + 0.5)) / kinds.length);
       const sx = t.x - Math.cos(a) * (t.rw / 2 + 16);
       const sy = t.y + Math.sin(a) * (t.rh / 2 + 22);
       ctx.beginPath();
       ctx.arc(sx, sy, 11, 0, Math.PI * 2);
-      if (s.kind === "npc") {
+      if (kind === "npc") {
         ctx.fillStyle = `hsl(${(i * 67 + t.x) % 360} 45% 55%)`;
-      } else if (s.kind === "player") {
-        ctx.fillStyle = C.gold;
+      } else if (kind === "human") {
+        const id = humanIds[humanCursor++];
+        const p = this.net?.room?.players.find((q) => q.id === id);
+        ctx.fillStyle = p ? `hsl(${p.hue} 70% 55%)` : C.gold;
       } else {
         ctx.fillStyle = "rgba(255,255,255,0.13)";
       }
       ctx.fill();
     });
 
-    // Placard.
     const ls = `${money(t.rules.minBet)}-${money(t.rules.maxBet)}`;
     fillRound(ctx, { x: t.x - 44, y: t.y - 12, w: 88, h: 24 }, 5, "rgba(8,14,10,0.55)");
     text(ctx, ls, t.x, t.y + 1, {
@@ -305,7 +394,6 @@ export class FloorScene implements Scene {
       ctx.fillStyle = `hsl(${n.hue} 40% 52%)`;
       ctx.fill();
     }
-    // Pit boss: dark suit, always facing you.
     const pb = this.casino.pitBoss;
     ctx.beginPath();
     ctx.ellipse(pb.x, pb.y + 13, 12, 5, 0, 0, Math.PI * 2);
@@ -325,17 +413,47 @@ export class FloorScene implements Scene {
     });
   }
 
+  private drawTeammates(f: Frame): void {
+    const net = this.net;
+    if (!net) return;
+    const { ctx } = f;
+    for (const p of net.teammates) {
+      if (p.tableId) continue; // drawn in their seat instead
+      ctx.beginPath();
+      ctx.ellipse(p.x, p.y + 13, 12, 5, 0, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(0,0,0,0.4)";
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, PLAYER_R, 0, Math.PI * 2);
+      ctx.fillStyle = p.online ? `hsl(${p.hue} 70% 55%)` : "#4b5560";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(0,0,0,0.4)";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      text(ctx, p.name, p.x, p.y - 22, {
+        size: 11,
+        color: "#dfe6ee",
+        align: "center",
+        weight: "600",
+      });
+      if (p.suspicion > 22) {
+        fillRound(ctx, { x: p.x - 16, y: p.y - 18, w: 32, h: 4 }, 2, heatTint(p.suspicion));
+      }
+    }
+  }
+
   private drawPlayer(f: Frame): void {
     const { ctx } = f;
     const p = this.player;
     const bob = Math.sin(p.step) * 1.6;
+    const hue = this.net?.me?.hue;
     ctx.beginPath();
     ctx.ellipse(p.x, p.y + 13, 12, 5, 0, 0, Math.PI * 2);
     ctx.fillStyle = "rgba(0,0,0,0.4)";
     ctx.fill();
     ctx.beginPath();
     ctx.arc(p.x, p.y + bob, PLAYER_R, 0, Math.PI * 2);
-    ctx.fillStyle = C.gold;
+    ctx.fillStyle = hue !== undefined ? `hsl(${hue} 75% 58%)` : C.gold;
     ctx.fill();
     ctx.strokeStyle = "#8a6b1f";
     ctx.lineWidth = 2;
@@ -368,20 +486,25 @@ export class FloorScene implements Scene {
       weight: "600",
     });
 
-    // Heat: presented as body language plus a coarse meter.
-    const s = session.surveillance;
+    const heat = this.heat;
     fillRound(ctx, { x: VW - 366, y: 14, w: 350, h: 66 }, 10, "rgba(12,17,22,0.86)", C.line);
     text(ctx, "THE PIT", VW - 350, 36, { size: 10, color: C.faint, weight: "700" });
-    bar(f, { x: VW - 350, y: 44, w: 318, h: 12 }, s.suspicion / 100, heatColor(s.suspicion));
-    text(ctx, s.tellText(), VW - 350, 74, { size: 12, color: C.dim, maxWidth: 330 });
+    bar(f, { x: VW - 350, y: 44, w: 318, h: 12 }, heat.suspicion / 100, heatTint(heat.suspicion));
+    text(ctx, attentionTell(heat.attention), VW - 350, 74, { size: 12, color: C.dim });
 
     if (this.noteT > 0) {
-      const w = Math.min(700, ctx.measureText(this.note).width + 260);
+      const w = Math.min(760, ctx.measureText(this.note).width + 260);
       fillRound(ctx, { x: VW / 2 - w / 2, y: 96, w, h: 34 }, 8, "rgba(12,17,22,0.9)", C.line);
-      text(ctx, this.note, VW / 2, 113, { size: 14, color: C.text, align: "center", baseline: "middle" });
+      text(ctx, this.note, VW / 2, 113, {
+        size: 14,
+        color: C.text,
+        align: "center",
+        baseline: "middle",
+      });
     }
 
-    if (this.game.session.surveillance.backoffPending) {
+    const suitsComing = this.net ? (this.net.me?.backoffIn ?? -1) >= 0 : this.game.session.surveillance.backoffPending;
+    if (suitsComing) {
       const a = 0.25 + Math.sin(f.time * 6) * 0.12;
       ctx.fillStyle = `rgba(224,85,75,${a})`;
       ctx.fillRect(0, 0, VW, VH);
@@ -390,6 +513,14 @@ export class FloorScene implements Scene {
         weight: "700",
         align: "center",
         color: "#ffd9d5",
+      });
+    }
+
+    if (this.net) {
+      text(ctx, "C call the count   ·   Q signal", VW / 2, VH - 24, {
+        size: 12,
+        color: C.faint,
+        align: "center",
       });
     }
   }
@@ -427,14 +558,25 @@ export class FloorScene implements Scene {
     this.activate(p);
   }
 
+  private freeSeatsAt(t: CasinoTable): number {
+    const brief = this.briefFor(t.id);
+    if (brief) return brief.seats.filter((s) => s === "empty").length;
+    return t.sim.freeSeats().length;
+  }
+
   private promptLines(p: Interaction): string[] {
     if (p.kind === "table" && p.table) {
       const t = p.table;
-      const free = t.sim.freeSeats().length;
+      const free = this.freeSeatsAt(t);
+      const mates = this.briefFor(t.id)?.humans.length ?? 0;
       return [
         `Sit at ${t.rules.name}`,
         rulesSummary(t.rules),
-        free > 0 ? `${free} open seat${free === 1 ? "" : "s"}` : "Table is full",
+        free > 0
+          ? `${free} open seat${free === 1 ? "" : "s"}${mates > 0 ? `  ·  ${mates} of you already here` : ""}`
+          : mates > 0
+            ? "Full, but the pit will move an NPC for you"
+            : "Table is full",
       ];
     }
     switch (p.kind) {
@@ -455,21 +597,42 @@ export class FloorScene implements Scene {
 
   private activate(p: Interaction): void {
     const session = this.game.session;
+    const net = this.net;
     switch (p.kind) {
       case "table": {
         const t = p.table!;
-        const free = t.sim.freeSeats();
-        if (free.length === 0) {
+        if (net) {
+          if (this.freeSeatsAt(t) === 0 && (this.briefFor(t.id)?.humans.length ?? 0) === 0) {
+            this.say("No open seats. Try another table.");
+            return;
+          }
+          this.sitPending = t.id;
+          net.send({ t: "sit", tableId: t.id });
+          this.say("Buying in...");
+          return;
+        }
+        if (t.sim.freeSeats().length === 0) {
           this.say("No open seats. Try another table.");
           return;
         }
-        // Hands you did not watch have moved the count without you.
         t.sim.burnUnseen(Math.floor(t.awaySeconds / 45));
         t.awaySeconds = 0;
-        this.game.setScene(new TableScene(this.game, this, t));
+        const seat = t.sim.bestFreeSeat();
+        if (seat === null) return;
+        t.sim.sit(seat, {
+          playerId: "you",
+          name: "You",
+          account: session,
+        });
+        const controller: TableController = new LocalTable(t.id, t.sim, t.rulesId);
+        this.game.setScene(new TableScene(this.game, this, t, controller));
         break;
       }
       case "bar": {
+        if (net) {
+          net.send({ t: "cover", kind: "drink" });
+          return;
+        }
         if (session.bankroll < 15) {
           this.say("You cannot even cover a drink.");
           return;
@@ -481,12 +644,20 @@ export class FloorScene implements Scene {
         break;
       }
       case "restroom": {
+        if (net) {
+          net.send({ t: "cover", kind: "break" });
+          return;
+        }
         session.surveillance.applyCover(15, "took a break");
         this.advanceClock(20);
         this.say("Twenty minutes off the floor. The pit's attention drifts. -15 heat.");
         break;
       }
       case "cashier": {
+        if (net) {
+          net.send({ t: "cover", kind: "cashier" });
+          return;
+        }
         session.surveillance.applyCover(5, "coloured up");
         this.advanceClock(10);
         if (session.bankroll >= 10000) {
@@ -509,14 +680,6 @@ export class FloorScene implements Scene {
         break;
     }
   }
-}
-
-function heatColor(v: number): string {
-  if (v < 22) return C.green;
-  if (v < 45) return "#9ecf4a";
-  if (v < 70) return C.gold;
-  if (v < 92) return C.heat;
-  return C.red;
 }
 
 function clockString(minutes: number): string {

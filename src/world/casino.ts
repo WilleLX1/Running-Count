@@ -1,7 +1,7 @@
 import { clamp, dist, type Rect } from "../core/math";
 import { pick, randRange, type Rng } from "../core/rng";
 import { TABLE_PRESETS, type TableRules } from "../blackjack/rules";
-import { TableSim, type PlayerAccount, type SimHooks } from "../blackjack/sim";
+import { TableSim, type SimHooks } from "../blackjack/sim";
 
 export const WORLD_W = 1760;
 export const WORLD_H = 1180;
@@ -32,6 +32,8 @@ export interface CasinoTable {
   rw: number;
   rh: number;
   rules: TableRules;
+  /** Preset id, so a table can be named on the wire without shipping its rules. */
+  rulesId: string;
   sim: TableSim;
   /** Seconds of game time since the player last watched this shoe. */
   awaySeconds: number;
@@ -69,12 +71,11 @@ export class Casino {
 
   constructor(
     private rng: Rng,
-    account: PlayerAccount,
-    hooksFor: (table: CasinoTable) => SimHooks,
+    hooksFor: (table: CasinoTable) => SimHooks = () => ({}),
   ) {
     this.buildWalls();
     this.buildFeatures();
-    this.buildTables(account, hooksFor);
+    this.buildTables(hooksFor);
     this.buildNpcs();
   }
 
@@ -153,7 +154,7 @@ export class Casino {
     }
   }
 
-  private buildTables(account: PlayerAccount, hooksFor: (t: CasinoTable) => SimHooks): void {
+  private buildTables(hooksFor: (t: CasinoTable) => SimHooks): void {
     const layout = [
       { x: 470, y: 470, preset: 0 },
       { x: 900, y: 470, preset: 1 },
@@ -174,12 +175,13 @@ export class Casino {
         rw,
         rh,
         rules,
+        rulesId: rules.id,
         sim: null as unknown as TableSim,
         awaySeconds: 999,
         useX: spot.x,
         useY: spot.y + rh / 2 + 46,
       };
-      table.sim = new TableSim(rules, this.rng, account, hooksFor(table));
+      table.sim = new TableSim(rules, this.rng, hooksFor(table));
       this.tables.push(table);
       this.solids.push({ x: spot.x - rw / 2, y: spot.y - rh / 2, w: rw, h: rh });
     }

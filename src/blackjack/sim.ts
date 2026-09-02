@@ -31,21 +31,45 @@ export interface NpcBrain {
   superstition: number;
 }
 
+export interface PlayerAccount {
+  bankroll: number;
+}
+
 export interface Seat {
   index: number;
-  kind: "empty" | "player" | "npc";
+  kind: "empty" | "human" | "npc";
   name: string;
+  /** Set for human seats. Local solo play uses the id "you". */
+  playerId: string | null;
+  /** Chips in the circle for the round in progress. */
   bet: number;
+  /** Chips pushed out but not yet committed. */
+  pendingBet: number;
+  betLocked: boolean;
+  sittingOut: boolean;
   hands: Hand[];
   active: number;
   insurance: number;
+  insuranceAnswered: boolean;
+  /** NPC chip tray. Humans draw on their own account. */
   chips: number;
+  account: PlayerAccount | null;
   npc?: NpcBrain;
   flash?: { text: string; color: string; t: number };
+  /** Everything this seat has put at risk this round, insurance included. */
+  staked: number;
+  queuedAction: Action | null;
+  /**
+   * Stood up while their cards were already out. The hand is played to the end
+   * and paid to their account, then the seat empties.
+   */
+  leaving: boolean;
 }
 
 export interface RoundSummary {
   round: number;
+  seatIndex: number;
+  playerId: string | null;
   bet: number;
   net: number;
   /** True count at the moment the bet was locked in -- what surveillance correlates against. */
@@ -58,16 +82,20 @@ export interface RoundSummary {
   satOut: boolean;
 }
 
-export interface PlayerAccount {
-  bankroll: number;
-}
-
 export interface SimHooks {
   onCardRevealed?: (c: Card) => void;
+  /** Fires once per seated human per round, including rounds they sat out. */
   onRoundEnd?: (s: RoundSummary) => void;
-  onShuffle?: () => void;
+  /** Carries the running count as it stood before the wash. */
+  onShuffle?: (runningBefore: number) => void;
   onPhase?: (p: Phase) => void;
   onMessage?: (text: string, color: string) => void;
+}
+
+export interface SitRequest {
+  playerId: string;
+  name: string;
+  account: PlayerAccount;
 }
 
 const NPC_NAMES = [
@@ -85,10 +113,15 @@ const NPC_NAMES = [
   "Chip",
 ];
 
+/** Seconds a table will wait on a human before dealing around them. */
+const BET_CLOCK = 20;
+const DECISION_CLOCK = 30;
+const INSURANCE_CLOCK = 12;
+
 /**
- * Drives one blackjack table. Deterministic given (seed, player actions) and
- * advanced purely by update(dt), so an authoritative server can run the exact
- * same class later and broadcast its state.
+ * Drives one blackjack table with any mix of humans and NPCs in the seats.
+ * Deterministic given (seed, seat actions) and advanced purely by update(dt),
+ * so the co-op server runs this exact class and broadcasts the result.
  */
 export class TableSim {
   readonly shoe: Shoe;
@@ -97,33 +130,21 @@ export class TableSim {
   seats: Seat[] = [];
   dealer: { cards: Card[]; holeHidden: boolean } = { cards: [], holeHidden: true };
 
-  playerSeat: number | null = null;
-  /** Chips the player has pushed out for the next round. */
-  pendingBet = 0;
-  betLocked = false;
-  sittingOut = false;
-
-  offeringInsurance = false;
-  insuranceResolved = false;
-
   round = 0;
-  roundsAtTable = 0;
   timer = 0;
-  /** Cards dealt this round, for pacing the "dealer is talking" beats. */
+  /** Counts down while the table waits on a human. Infinity when it will wait forever. */
+  clock = Infinity;
+
+  private dt = 0;
   private dealQueue: { seat: number; hidden: boolean }[] = [];
-  private queuedPlayerAction: Action | null = null;
   private trueCountAtBet = 0;
   private runningCountAtBet = 0;
   private decksAtBet = 0;
-  private stakedThisRound = 0;
   private dealerPeeked = false;
-
-  lastSummary: RoundSummary | null = null;
 
   constructor(
     public rules: TableRules,
     private rng: Rng,
-    private account: PlayerAccount,
     public hooks: SimHooks = {},
   ) {
     this.shoe = new Shoe(rules.decks, rules.penetration, rng);
@@ -138,11 +159,20 @@ export class TableSim {
       index,
       kind: "empty",
       name: "",
+      playerId: null,
       bet: 0,
+      pendingBet: 0,
+      betLocked: false,
+      sittingOut: false,
       hands: [],
       active: 0,
       insurance: 0,
+      insuranceAnswered: false,
       chips: 0,
+      account: null,
+      staked: 0,
+      queuedAction: null,
+      leaving: false,
     };
   }
 
@@ -154,108 +184,155 @@ export class TableSim {
         let guard = 0;
         while (used.has(name) && guard++ < 20) name = pick(NPC_NAMES, this.rng);
         used.add(name);
-        seat.kind = "npc";
-        seat.name = name;
-        seat.chips = this.rules.minBet * randRange(this.rng, 15, 60);
-        seat.npc = {
-          skill: randRange(this.rng, 0.5, 0.97),
-          aggression: randRange(this.rng, 1, 3.5),
-          superstition: this.rng(),
-        };
+        this.makeNpc(seat, name);
       }
     }
   }
 
-  get playerSeated(): boolean {
-    return this.playerSeat !== null;
+  private makeNpc(seat: Seat, name: string): void {
+    seat.kind = "npc";
+    seat.name = name;
+    seat.playerId = null;
+    seat.account = null;
+    seat.chips = this.rules.minBet * randRange(this.rng, 15, 60);
+    seat.npc = {
+      skill: randRange(this.rng, 0.5, 0.97),
+      aggression: randRange(this.rng, 1, 3.5),
+      superstition: this.rng(),
+    };
   }
 
   freeSeats(): number[] {
     return this.seats.filter((s) => s.kind === "empty").map((s) => s.index);
   }
 
-  sit(index: number, name = "You"): boolean {
+  humans(): Seat[] {
+    return this.seats.filter((s) => s.kind === "human");
+  }
+
+  /** Includes a seat whose owner has walked but whose hand is still live. */
+  private seatFor(playerId: string): Seat | null {
+    return this.seats.find((s) => s.kind === "human" && s.playerId === playerId) ?? null;
+  }
+
+  seatOf(playerId: string): Seat | null {
+    const seat = this.seatFor(playerId);
+    return seat && !seat.leaving ? seat : null;
+  }
+
+  /**
+   * Sit a human down. With bumpNpc the table will move an NPC along so that
+   * teammates can get onto the same felt.
+   */
+  sit(index: number, who: SitRequest, bumpNpc = false): boolean {
     const seat = this.seats[index];
-    if (!seat || seat.kind !== "empty") return false;
-    seat.kind = "player";
-    seat.name = name;
-    this.playerSeat = index;
-    this.sittingOut = this.phase !== "betting";
-    this.roundsAtTable = 0;
-    this.message(`You sit down at seat ${index + 1}.`, "#8fa3b5");
+    if (!seat) return false;
+    if (seat.kind === "human") return false;
+    if (seat.kind === "npc") {
+      if (!bumpNpc || seat.hands.length > 0) return false;
+      this.message(`${seat.name} colours up and wanders off.`, "#8fa3b5");
+    }
+    const keep = this.makeSeat(index);
+    Object.assign(seat, keep);
+    seat.kind = "human";
+    seat.name = who.name;
+    seat.playerId = who.playerId;
+    seat.account = who.account;
+    seat.pendingBet = Math.max(this.rules.minBet, Math.min(who.account.bankroll, this.rules.minBet));
+    // Joining mid-round means watching this one out.
+    seat.sittingOut = this.phase !== "betting";
     return true;
   }
 
-  standUp(): void {
-    if (this.playerSeat === null) return;
-    const seat = this.seats[this.playerSeat];
-    seat.kind = "empty";
-    seat.name = "";
-    seat.hands = [];
-    seat.bet = 0;
-    this.playerSeat = null;
-    this.pendingBet = 0;
-    this.betLocked = false;
+  /** Best open seat for a newcomer: third base first, then anywhere. */
+  bestFreeSeat(): number | null {
+    const free = this.freeSeats();
+    if (free.length > 0) return free[free.length - 1];
+    return null;
   }
 
-  get seat(): Seat | null {
-    return this.playerSeat === null ? null : this.seats[this.playerSeat];
+  standUp(playerId: string): void {
+    const seat = this.seatFor(playerId);
+    if (!seat) return;
+    if (this.phase === "betting" || seat.bet <= 0) {
+      Object.assign(seat, this.makeSeat(seat.index));
+      return;
+    }
+    // You cannot pull a bet back once the cards are out. The dealer plays the
+    // hand for you and the seat clears at the end of the round.
+    seat.leaving = true;
+    seat.queuedAction = null;
+    this.message(`${seat.name} leaves their bet in the circle.`, "#8fa3b5");
   }
 
   // ------------------------------------------------------------ player API
 
-  setBet(amount: number): void {
-    if (this.phase !== "betting" || this.betLocked) return;
-    const clamped = Math.max(0, Math.min(this.rules.maxBet, Math.min(amount, this.account.bankroll)));
-    this.pendingBet = clamped;
+  setBet(playerId: string, amount: number): void {
+    const seat = this.seatOf(playerId);
+    if (!seat || this.phase !== "betting" || seat.betLocked) return;
+    const bankroll = seat.account?.bankroll ?? 0;
+    seat.pendingBet = Math.max(0, Math.min(this.rules.maxBet, Math.min(amount, bankroll)));
   }
 
-  addBet(delta: number): void {
-    this.setBet(this.pendingBet + delta);
+  addBet(playerId: string, delta: number): void {
+    const seat = this.seatOf(playerId);
+    if (!seat) return;
+    this.setBet(playerId, seat.pendingBet + delta);
   }
 
-  confirmBet(): boolean {
-    if (this.phase !== "betting" || this.playerSeat === null) return false;
-    if (this.pendingBet < this.rules.minBet) return false;
-    if (this.pendingBet > this.account.bankroll) return false;
-    this.betLocked = true;
-    this.sittingOut = false;
+  confirmBet(playerId: string): boolean {
+    const seat = this.seatOf(playerId);
+    if (!seat || this.phase !== "betting") return false;
+    if (seat.pendingBet < this.rules.minBet) return false;
+    if (seat.pendingBet > (seat.account?.bankroll ?? 0)) return false;
+    seat.betLocked = true;
+    seat.sittingOut = false;
     return true;
   }
 
   /** Wong out: skip this round but keep watching the shoe. */
-  setSittingOut(v: boolean): void {
-    if (this.phase !== "betting") return;
-    this.sittingOut = v;
-    if (v) this.betLocked = false;
+  setSittingOut(playerId: string, v: boolean): void {
+    const seat = this.seatOf(playerId);
+    if (!seat || this.phase !== "betting") return;
+    seat.sittingOut = v;
+    if (v) seat.betLocked = false;
   }
 
-  act(action: Action): void {
+  act(playerId: string, action: Action): void {
     if (this.phase !== "playing") return;
     const actor = this.currentActor();
-    if (!actor || this.seats[actor.seat].kind !== "player") return;
-    this.queuedPlayerAction = action;
+    if (!actor) return;
+    const seat = this.seats[actor.seat];
+    if (seat.kind !== "human" || seat.playerId !== playerId || seat.leaving) return;
+    seat.queuedAction = action;
   }
 
-  answerInsurance(take: boolean): void {
-    if (!this.offeringInsurance || this.playerSeat === null) return;
-    const seat = this.seats[this.playerSeat];
+  answerInsurance(playerId: string, take: boolean): void {
+    const seat = this.seatOf(playerId);
+    if (!seat || this.phase !== "insurance" || seat.insuranceAnswered) return;
     if (take) {
       const amount = Math.floor(seat.bet / 2);
-      if (amount > 0 && this.account.bankroll >= amount) {
-        this.account.bankroll -= amount;
-        this.stakedThisRound += amount;
+      if (amount > 0 && (seat.account?.bankroll ?? 0) >= amount) {
+        seat.account!.bankroll -= amount;
+        seat.staked += amount;
         seat.insurance = amount;
-        this.message("Insurance taken.", "#f0c14b");
+        this.message(`${seat.name} takes insurance.`, "#f0c14b");
       }
     }
-    this.offeringInsurance = false;
-    this.timer = 0.35;
+    seat.insuranceAnswered = true;
+  }
+
+  /** True when this seat still owes the table an insurance decision. */
+  offeringInsuranceTo(playerId: string): boolean {
+    if (this.phase !== "insurance") return false;
+    const seat = this.seatOf(playerId);
+    return !!seat && seat.bet > 0 && !seat.insuranceAnswered;
   }
 
   // ------------------------------------------------------------- main loop
 
   update(dt: number): void {
+    this.dt = dt;
     if (this.timer > 0) {
       this.timer -= dt;
       if (this.timer > 0) {
@@ -309,44 +386,59 @@ export class TableSim {
     this.hooks.onMessage?.(text, color);
   }
 
+  /**
+   * A lone human gets all the time in the world; once there is a team at the
+   * table the dealer starts counting, so nobody can stall the shoe.
+   */
+  private startClock(seconds: number): void {
+    this.clock = this.humans().length > 1 ? seconds : Infinity;
+  }
+
   // ------------------------------------------------------------ phase steps
 
   private stepBetting(): void {
-    // NPCs post their bets first, then we wait on the player.
     for (const s of this.seats) {
-      if (s.kind === "npc" && s.bet === 0) {
-        s.bet = this.npcBet(s);
+      if (s.kind === "npc" && s.bet === 0) s.bet = this.npcBet(s);
+    }
+
+    const waiting = this.seats.filter(
+      (s) => s.kind === "human" && !s.betLocked && !s.sittingOut,
+    );
+    if (waiting.length > 0) {
+      if (this.clock === Infinity) return;
+      this.clock -= this.dt;
+      if (this.clock > 0) return;
+      for (const s of waiting) {
+        s.sittingOut = true;
+        this.message(`${s.name} misses the hand.`, "#8fa3b5");
       }
     }
-    const waitingOnPlayer = this.playerSeat !== null && !this.betLocked && !this.sittingOut;
-    if (waitingOnPlayer) return;
+    this.clock = Infinity;
 
-    const playerSeat = this.seat;
-    if (playerSeat) {
-      if (this.betLocked && this.pendingBet >= this.rules.minBet) {
-        playerSeat.bet = this.pendingBet;
-        this.account.bankroll -= this.pendingBet;
-        this.stakedThisRound = this.pendingBet;
+    for (const seat of this.seats) {
+      if (seat.kind !== "human") continue;
+      if (seat.betLocked && seat.pendingBet >= this.rules.minBet) {
+        seat.bet = seat.pendingBet;
+        seat.account!.bankroll -= seat.pendingBet;
+        seat.staked = seat.pendingBet;
       } else {
-        playerSeat.bet = 0;
-        this.stakedThisRound = 0;
+        seat.bet = 0;
+        seat.staked = 0;
       }
-    } else {
-      this.stakedThisRound = 0;
     }
 
     this.trueCountAtBet = this.count.trueCount(this.shoe.decksRemaining);
     this.runningCountAtBet = this.count.running;
     this.decksAtBet = this.shoe.decksRemaining;
 
-    // Build hands and the deal order.
     this.dealer = { cards: [], holeHidden: true };
     this.dealerPeeked = false;
-    this.insuranceResolved = false;
     for (const s of this.seats) {
       s.hands = [];
       s.active = 0;
       s.insurance = 0;
+      s.insuranceAnswered = false;
+      s.queuedAction = null;
       if (s.bet > 0) s.hands.push(newHand(s.bet));
     }
 
@@ -358,13 +450,12 @@ export class TableSim {
     this.dealQueue.push({ seat: -1, hidden: true });
 
     if (live.length === 0) {
-      // Nobody is betting -- table idles briefly.
+      // Nobody has a bet out -- the table idles rather than burning the shoe.
       this.timer = 0.6;
       return;
     }
 
     this.round++;
-    if (this.seat && this.seat.bet > 0) this.roundsAtTable++;
     this.setPhase("dealing");
     this.timer = 0.25;
   }
@@ -378,14 +469,10 @@ export class TableSim {
     const card = this.shoe.draw();
     if (next.seat === -1) {
       this.dealer.cards.push(card);
-      if (next.hidden) {
-        this.dealer.holeHidden = true;
-      } else {
-        this.reveal(card);
-      }
+      if (next.hidden) this.dealer.holeHidden = true;
+      else this.reveal(card);
     } else {
-      const seat = this.seats[next.seat];
-      seat.hands[0].cards.push(card);
+      this.seats[next.seat].hands[0].cards.push(card);
       this.reveal(card);
     }
     this.timer = this.rules.dealSpeed;
@@ -394,23 +481,30 @@ export class TableSim {
   private afterDeal(): void {
     const up = this.dealer.cards[0];
     if (dealerValue(up) === 11) {
-      // Ace showing: offer insurance to everyone still breathing.
       for (const s of this.seats) {
         if (s.kind === "npc" && s.bet > 0 && s.npc && this.rng() < s.npc.superstition * 0.5) {
           s.insurance = Math.floor(s.bet / 2);
           s.chips -= s.insurance;
         }
+        s.insuranceAnswered = s.kind !== "human" || s.bet <= 0 || s.leaving;
       }
-      this.offeringInsurance = this.playerSeat !== null && (this.seat?.bet ?? 0) > 0;
       this.setPhase("insurance");
-      this.timer = this.offeringInsurance ? 0 : 0.8;
+      this.startClock(INSURANCE_CLOCK);
+      this.timer = this.seats.some((s) => !s.insuranceAnswered) ? 0 : 0.8;
       return;
     }
     this.peekAndContinue();
   }
 
   private stepInsurance(): void {
-    if (this.offeringInsurance) return; // waiting on the player
+    const pending = this.seats.filter((s) => !s.insuranceAnswered);
+    if (pending.length > 0) {
+      if (this.clock === Infinity) return;
+      this.clock -= this.dt;
+      if (this.clock > 0) return;
+      for (const s of pending) s.insuranceAnswered = true;
+    }
+    this.clock = Infinity;
     this.peekAndContinue();
   }
 
@@ -421,8 +515,7 @@ export class TableSim {
     if (!this.dealerPeeked && (upv === 10 || upv === 11)) {
       this.dealerPeeked = true;
       const hole = this.dealer.cards[1];
-      const total = cardValue(up.rank) + cardValue(hole.rank);
-      if (total === 21) {
+      if (cardValue(up.rank) + cardValue(hole.rank) === 21) {
         this.dealer.holeHidden = false;
         this.reveal(hole);
         this.message("Dealer has blackjack.", "#e0554b");
@@ -432,6 +525,7 @@ export class TableSim {
       }
     }
     this.setPhase("playing");
+    this.startClock(DECISION_CLOCK);
     this.timer = 0.35;
   }
 
@@ -439,8 +533,7 @@ export class TableSim {
     for (const s of this.seats) {
       if (s.bet <= 0) continue;
       for (let h = 0; h < s.hands.length; h++) {
-        const hand = s.hands[h];
-        if (!hand.done) return { seat: s.index, hand: h };
+        if (!s.hands[h].done) return { seat: s.index, hand: h };
       }
     }
     return null;
@@ -462,16 +555,12 @@ export class TableSim {
       const card = this.shoe.draw();
       hand.cards.push(card);
       this.reveal(card);
-      if (hand.fromSplit && hand.cards[0].rank === "A" && !this.rules.hitSplitAces) {
-        hand.done = true;
-      }
-      const t = handTotal(hand.cards);
-      if (t.total === 21) hand.done = true;
+      if (hand.fromSplit && hand.cards[0].rank === "A" && !this.rules.hitSplitAces) hand.done = true;
+      if (handTotal(hand.cards).total === 21) hand.done = true;
       this.timer = this.rules.dealSpeed;
       return;
     }
 
-    // Naturals and 21s never act.
     const t = handTotal(hand.cards);
     if (t.total >= 21 || isBlackjack(hand)) {
       hand.done = true;
@@ -479,15 +568,31 @@ export class TableSim {
       return;
     }
 
-    if (seat.kind === "player") {
-      const action = this.queuedPlayerAction;
-      if (!action) return; // block until the player decides
-      this.queuedPlayerAction = null;
+    if (seat.kind === "human" && !seat.leaving) {
+      const action = seat.queuedAction;
+      if (!action) {
+        if (this.clock === Infinity) return;
+        this.clock -= this.dt;
+        if (this.clock > 0) return;
+        this.message(`${seat.name} takes too long. The dealer stands them.`, "#8fa3b5");
+        hand.done = true;
+        this.startClock(DECISION_CLOCK);
+        return;
+      }
+      seat.queuedAction = null;
       this.applyAction(seat, actor.hand, action);
+      this.startClock(DECISION_CLOCK);
       return;
     }
 
-    // NPC turn.
+    // A walked-away seat is finished off by the book, not by hunches.
+    if (seat.leaving) {
+      const bankroll = seat.account?.bankroll ?? 0;
+      const legal = legalActions(hand, seat.hands.length, this.rules, bankroll);
+      this.applyAction(seat, actor.hand, basicStrategy(hand, this.dealer.cards[0], this.rules, legal));
+      return;
+    }
+
     const legal = legalActions(hand, seat.hands.length, this.rules, seat.chips);
     const brain = seat.npc!;
     let action: Action;
@@ -504,7 +609,7 @@ export class TableSim {
 
   private applyAction(seat: Seat, handIndex: number, action: Action): void {
     const hand = seat.hands[handIndex];
-    const bankroll = seat.kind === "player" ? this.account.bankroll : seat.chips;
+    const bankroll = seat.kind === "human" ? (seat.account?.bankroll ?? 0) : seat.chips;
     const legal = legalActions(hand, seat.hands.length, this.rules, bankroll);
 
     switch (action) {
@@ -513,8 +618,7 @@ export class TableSim {
         const c = this.shoe.draw();
         hand.cards.push(c);
         this.reveal(c);
-        const t = handTotal(hand.cards);
-        if (t.total >= 21) hand.done = true;
+        if (handTotal(hand.cards).total >= 21) hand.done = true;
         this.timer = this.rules.dealSpeed;
         break;
       }
@@ -557,9 +661,9 @@ export class TableSim {
   }
 
   private takeChips(seat: Seat, amount: number): void {
-    if (seat.kind === "player") {
-      this.account.bankroll -= amount;
-      this.stakedThisRound += amount;
+    if (seat.kind === "human") {
+      seat.account!.bankroll -= amount;
+      seat.staked += amount;
     } else {
       seat.chips -= amount;
     }
@@ -591,19 +695,25 @@ export class TableSim {
 
   private stepSettle(): void {
     const dealerTotal = handTotal(this.dealer.cards).total;
-    const dealerBJ =
-      this.dealer.cards.length === 2 && dealerTotal === 21;
-    let playerPayout = 0;
-    const results: HandResult[] = [];
+    const dealerBJ = this.dealer.cards.length === 2 && dealerTotal === 21;
 
     for (const seat of this.seats) {
-      if (seat.bet <= 0) continue;
+      const seated = seat.kind === "human";
+      if (seat.bet <= 0) {
+        if (seated) this.emitSummary(seat, 0, []);
+        continue;
+      }
       let seatPayout = 0;
+      const results: HandResult[] = [];
 
       if (seat.insurance > 0) {
         if (dealerBJ) seatPayout += seat.insurance * 3;
-        if (seat.kind === "player") {
-          this.flash(seat, dealerBJ ? "Insurance pays" : "Insurance lost", dealerBJ ? "#3fbf6f" : "#e0554b");
+        if (seated) {
+          this.flash(
+            seat,
+            dealerBJ ? "Insurance pays" : "Insurance lost",
+            dealerBJ ? "#3fbf6f" : "#e0554b",
+          );
         }
       }
 
@@ -637,12 +747,18 @@ export class TableSim {
         hand.result = result;
         hand.payout = payout;
         seatPayout += payout;
-        if (seat.kind === "player") results.push(result);
+        results.push(result);
       }
 
-      if (seat.kind === "player") {
-        playerPayout = seatPayout;
-        this.account.bankroll += seatPayout;
+      if (seated) {
+        seat.account!.bankroll += seatPayout;
+        const net = seatPayout - seat.staked;
+        this.flash(
+          seat,
+          net > 0 ? `+$${Math.round(net)}` : net < 0 ? `-$${Math.abs(Math.round(net))}` : "push",
+          net > 0 ? "#3fbf6f" : net < 0 ? "#e0554b" : "#8fa3b5",
+        );
+        this.emitSummary(seat, seatPayout, results);
       } else {
         seat.chips += seatPayout;
         const staked = seat.hands.reduce((a, h) => a + h.bet, 0) + seat.insurance;
@@ -653,59 +769,61 @@ export class TableSim {
           net > 0 ? "#3fbf6f" : net < 0 ? "#e0554b" : "#8fa3b5",
         );
         if (seat.chips < this.rules.minBet) {
-          // Broke NPCs go find an ATM.
-          seat.kind = "empty";
-          seat.name = "";
-          seat.hands = [];
+          const index = seat.index;
+          Object.assign(seat, this.makeSeat(index));
         }
       }
     }
 
-    const net = playerPayout - this.stakedThisRound;
-    if (this.seat && this.stakedThisRound > 0) {
-      this.flash(
-        this.seat,
-        net > 0 ? `+$${Math.round(net)}` : net < 0 ? `-$${Math.abs(Math.round(net))}` : "push",
-        net > 0 ? "#3fbf6f" : net < 0 ? "#e0554b" : "#8fa3b5",
-      );
+    for (const s of this.seats) {
+      if (s.leaving) {
+        Object.assign(s, this.makeSeat(s.index));
+        continue;
+      }
+      s.bet = 0;
+      s.betLocked = false;
+      s.staked = 0;
+      if (s.kind === "human" && s.account) {
+        s.pendingBet = Math.min(s.pendingBet, s.account.bankroll);
+      }
     }
-
-    const summary: RoundSummary = {
-      round: this.round,
-      bet: this.stakedThisRound,
-      net,
-      trueCountAtBet: this.trueCountAtBet,
-      runningCountAtBet: this.runningCountAtBet,
-      decksRemaining: this.decksAtBet,
-      results,
-      insuranceTaken: (this.seat?.insurance ?? 0) > 0,
-      handsPlayed: this.seat?.hands.length ?? 0,
-      satOut: this.stakedThisRound === 0,
-    };
-    this.lastSummary = summary;
-    this.hooks.onRoundEnd?.(summary);
-
-    for (const s of this.seats) s.bet = 0;
-    this.pendingBet = Math.min(this.pendingBet, this.account.bankroll);
-    this.betLocked = false;
-    this.stakedThisRound = 0;
 
     if (this.shoe.cutCardOut) {
       this.setPhase("shuffle");
       this.timer = 1.8;
     } else {
       this.setPhase("betting");
-      // A seated player gets a real window to get a bet out -- long enough to
+      // A seated human gets a real window to get a bet out -- long enough to
       // wong back in when the count turns, short enough to feel like a dealer.
-      this.timer = this.seat ? 3.2 : 1.6;
+      this.timer = this.humans().length > 0 ? 3.2 : 1.6;
+      this.startClock(BET_CLOCK);
     }
   }
 
+  private emitSummary(seat: Seat, payout: number, results: HandResult[]): void {
+    const summary: RoundSummary = {
+      round: this.round,
+      seatIndex: seat.index,
+      playerId: seat.playerId,
+      bet: seat.staked,
+      net: payout - seat.staked,
+      trueCountAtBet: this.trueCountAtBet,
+      runningCountAtBet: this.runningCountAtBet,
+      decksRemaining: this.decksAtBet,
+      results,
+      insuranceTaken: seat.insurance > 0,
+      handsPlayed: seat.hands.length,
+      satOut: seat.staked === 0,
+    };
+    this.hooks.onRoundEnd?.(summary);
+  }
+
   private stepShuffle(): void {
+    const runningBefore = this.count.running;
     this.shoe.reshuffle();
     this.count.reset();
-    this.hooks.onShuffle?.();
-    this.message("Shuffle. Count resets to zero.", "#5aa9e6");
+    this.hooks.onShuffle?.(runningBefore);
+    this.message("Shuffle. The count resets to zero.", "#5aa9e6");
     for (const s of this.seats) {
       s.hands = [];
       s.bet = 0;
@@ -713,6 +831,7 @@ export class TableSim {
     this.dealer = { cards: [], holeHidden: true };
     this.setPhase("betting");
     this.timer = 1.4;
+    this.startClock(BET_CLOCK);
   }
 
   private flash(seat: Seat, textVal: string, color: string): void {
@@ -733,8 +852,8 @@ export class TableSim {
   }
 
   /**
-   * Hands that were dealt while the player was away from the table. The count
-   * moves and they do not get to see it -- which is exactly the point.
+   * Hands that were dealt while nobody was watching. The count moves and the
+   * player does not get to see it -- which is exactly the point.
    */
   burnUnseen(rounds: number): void {
     if (rounds <= 0) return;
@@ -759,12 +878,13 @@ export class TableSim {
     return this.dealer.cards[0] ?? null;
   }
 
-  /** Cards the player is allowed to act on right now, if it's their turn. */
-  playerTurn(): { hand: Hand; index: number } | null {
-    if (this.phase !== "playing" || this.playerSeat === null) return null;
+  /** The hand this player may act on right now, if it is their turn. */
+  turnOf(playerId: string): { hand: Hand; index: number } | null {
+    if (this.phase !== "playing") return null;
     const actor = this.currentActor();
-    if (!actor || actor.seat !== this.playerSeat) return null;
+    if (!actor) return null;
     const seat = this.seats[actor.seat];
+    if (seat.kind !== "human" || seat.playerId !== playerId || seat.leaving) return null;
     const hand = seat.hands[actor.hand];
     if (hand.cards.length < 2) return null;
     return { hand, index: actor.hand };

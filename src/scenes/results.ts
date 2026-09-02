@@ -33,6 +33,11 @@ export class ResultsScene implements Scene {
     if (s.bankroll > s.best.bankroll) s.best.bankroll = s.bankroll;
     s.best.countAccuracy = Math.max(s.best.countAccuracy, s.countAccuracy);
     s.save();
+    // Leaving the property ends your night; the rest of the team plays on.
+    if (this.game.net) {
+      this.game.net.close();
+      this.game.net = null;
+    }
   }
 
   frame(f: Frame): void {
