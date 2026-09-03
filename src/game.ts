@@ -1,5 +1,6 @@
 import type { Frame } from "./core/ui";
 import type { NetClient } from "./net/client";
+import { History } from "./state/history";
 import { Session } from "./state/session";
 
 export interface Scene {
@@ -18,6 +19,7 @@ export interface Toast {
 export class Game {
   scene: Scene | null = null;
   session = new Session();
+  history = new History();
   /** Set while a co-op session is live; null in solo. */
   net: NetClient | null = null;
   toasts: Toast[] = [];

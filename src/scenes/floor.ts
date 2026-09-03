@@ -118,6 +118,7 @@ export class FloorScene implements Scene {
     } else {
       this.clock += dt * TIME_SCALE;
       session.surveillance.update(dt, false);
+      session.noteHeat(session.surveillance.suspicion);
       for (const t of this.casino.tables) {
         // A hand you walked away from still has to be played out and paid.
         if (t.sim.humans().length > 0) t.sim.update(dt);

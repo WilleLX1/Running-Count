@@ -43,6 +43,8 @@ export interface Stats {
   biggestLoss: number;
   backoffs: number;
   timePlayed: number;
+  /** The highest the pit's interest ever got this session. */
+  peakHeat: number;
 }
 
 export function emptyStats(): Stats {
@@ -63,6 +65,7 @@ export function emptyStats(): Stats {
     biggestLoss: 0,
     backoffs: 0,
     timePlayed: 0,
+    peakHeat: 0,
   };
 }
 
@@ -87,10 +90,14 @@ export class Session {
   /** Career numbers that survive a session. */
   best = { bankroll: 2000, countAccuracy: 0, sessions: 0 };
 
+  /** Wall clock when this session began, for the history. */
+  startedAt = Date.now();
+
   reset(bankroll = 2000, unit = 10): void {
     this.bankroll = bankroll;
     this.startingBankroll = bankroll;
     this.unit = unit;
+    this.startedAt = Date.now();
     this.stats = emptyStats();
     this.surveillance = new Surveillance();
     this.recentDecisions = [];
@@ -105,6 +112,11 @@ export class Session {
     this.surveillance.suspicion = view.suspicion;
     this.surveillance.attention = view.attention;
     this.surveillance.breakdown = view.breakdown;
+    this.noteHeat(view.suspicion);
+  }
+
+  noteHeat(suspicion: number): void {
+    if (suspicion > this.stats.peakHeat) this.stats.peakHeat = suspicion;
   }
 
   recordRound(s: RoundSummary): void {

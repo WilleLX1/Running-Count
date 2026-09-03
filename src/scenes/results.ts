@@ -3,6 +3,7 @@ import { VH, VW } from "../core/renderer";
 import { C, bar, button, fillRound, panel, text, vignette, type Frame } from "../core/ui";
 import { money } from "../core/math";
 import { MenuScene } from "./menu";
+import { HistoryScene } from "./history";
 import { wrapText } from "./menu";
 
 export type EndReason = "walked" | "backoff" | "broke";
@@ -33,6 +34,40 @@ export class ResultsScene implements Scene {
     if (s.bankroll > s.best.bankroll) s.best.bankroll = s.bankroll;
     s.best.countAccuracy = Math.max(s.best.countAccuracy, s.countAccuracy);
     s.save();
+
+    // Written down before the connection goes, so co-op nights are recorded too.
+    const coop = this.game.net !== null;
+    if (s.stats.roundsPlayed > 0 || this.reason === "backoff") {
+      const endedAt = Date.now();
+      this.game.history.add({
+        kind: "casino",
+        at: endedAt,
+        startedAt: s.startedAt,
+        reason: this.reason,
+        coop,
+        assist: s.assist,
+        unit: s.unit,
+        startBankroll: s.startingBankroll,
+        endBankroll: s.bankroll,
+        rounds: s.stats.roundsPlayed,
+        hands: s.stats.handsPlayed,
+        wagered: s.stats.wagered,
+        net: s.bankroll - s.startingBankroll,
+        decisions: s.stats.decisions,
+        decisionsCorrect: s.stats.decisionsCorrect,
+        deviationsHit: s.stats.deviationsHit,
+        deviationsMissed: s.stats.deviationsMissed,
+        betsRated: s.stats.betsRated,
+        betsGood: s.stats.betsGood,
+        countChecks: s.stats.countChecks,
+        countChecksCorrect: s.stats.countChecksCorrect,
+        peakHeat: s.stats.peakHeat,
+        heat: { ...s.surveillance.breakdown },
+        minutes: (endedAt - s.startedAt) / 60_000,
+        activeMinutes: s.stats.timePlayed / 60,
+      });
+    }
+
     // Leaving the property ends your night; the rest of the team plays on.
     if (this.game.net) {
       this.game.net.close();
@@ -136,12 +171,17 @@ export class ResultsScene implements Scene {
       this.game.setScene(new MenuScene(this.game));
       return;
     }
+    if (button(f, { x: 356, y: 648, w: 220, h: 52 }, "See your history", { accent: C.purple, hotkey: "H" }) ||
+      f.input.consume("h")) {
+      this.game.setScene(new HistoryScene(this.game, () => this.game.setScene(new MenuScene(this.game))));
+      return;
+    }
     text(
       ctx,
       this.reason === "backoff"
         ? "Next session the pit starts a little more interested in you."
         : "Career best bankroll: " + money(s.best.bankroll),
-      366,
+      596,
       680,
       { size: 13, color: C.faint },
     );

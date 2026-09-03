@@ -46,9 +46,97 @@ meter tells you. Once the suits start walking you have seven seconds to colour u
 and leave; if they reach you, you are backed off and the house remembers your face
 into the next session.
 
-**A training room** (back room of the casino, or straight from the menu) with six
-drills: card tags, counting a deck against the clock, reading decks off the discard
-tray, true-count conversion, basic strategy, and the Illustrious 18 index plays.
+**A training room** (back room of the casino, or straight from the menu) with ten
+drills, built around the fact that counting is not one skill but three — tagging a
+card, chunking what you see, and holding a number:
+
+| Drill | What it trains |
+| --- | --- |
+| Card tags | The reflex. One card, +1 / 0 / −1. |
+| Cancel the pair | Chunking. Two to four cards at once and you call the net, never adding card by card. Grows with your streak, and times you. |
+| Count a deck | Speed. Cards flash by, one, two or three at a time, and you call the running count at the end. |
+| Count down a deck | Retention. One real deck dealt out bar the last card — a deck sums to zero, so your count names the card you cannot see. Self-verifying and impossible to game. |
+| Net the table | Scanning. A genuinely simulated settled table, every card face up, and you call the net before it is swept. Shows you the per-hand nets afterwards. |
+| Read the tray | Deck estimation off the discard tray. |
+| True count | Conversion, rounding toward zero. |
+| Basic strategy | Every hand against every upcard. |
+| Index plays | The Illustrious 18 with a true count attached. |
+| **Live table** | All of it at once, under a dealer who does not wait. |
+
+The live table is the one that carries the rest. It is a real dealer working a real
+shoe on the game's own engine and felt — you pick the number of players, the decks,
+the penetration and the dealer's speed, and then you do nothing but keep the count.
+No bets, no decisions. Hands play out with hits, splits and doubles, so the number
+of cards per round moves around the way it does at a table, which is the thing that
+actually breaks a count.
+
+- The dealer **asks for the running count between hands**, while the bets are
+  going out, as often as you like. Never mid-deal — that is not a thing that
+  happens, and it is not when the number is any use to you. At the cut card there
+  is always a final check, and that one also asks for decks remaining and the
+  true count.
+- A **speed ramp** winds the dealer up as the shoe goes on, and again on the next
+  shoe, so you are always sitting just past comfortable.
+- **Hold `C` to peek** at the count. It is tracked and shown in your score, so you
+  can watch yourself wean off it.
+- A **manual counter** on `+` / `−`, in three settings, because tagging a card
+  and holding a total are two different skills and it is worth training them
+  apart:
+  - **Visible** — somewhere to put the number, so you are adding rather than
+    remembering. Checks come pre-filled with whatever it says, and a check you
+    get wrong puts it back on the true number.
+  - **Blind** — the presses still land, but the total is masked. Checks ask what
+    you *remember* and score your presses separately, so the review can tell you
+    which half failed: *"Not your eyes. Your memory. Your presses tracked the
+    shoe the whole way — what you could not do was hold the total."*
+  - **Off** — nothing to lean on.
+- **Cancellation hints**, off by default: a strip of the last nine cards out with
+  the pairs that come to nothing bracketed and greyed, and what the remainder is
+  worth. Training wheels for reading the shoe in chunks rather than one card at a
+  time.
+- Afterwards you get a **drift replay**: the count plotted across the whole shoe
+  with every check marked, and the exact run of cards between the last check you
+  got right and the first you got wrong — *"You were right at card 83, then −1 out
+  by card 94. These are the 11 cards in between. They add up to −4."*
+
+With the manual counter on, the replay gets much sharper, because the game knows
+your number on **every** card rather than only at the checks. It draws your line
+over the shoe's and names the exact card the two parted on — *"Card 33 is where
+your counter and the shoe parted. You had −5 where the shoe had −4 — 1 low card
+went past you"* — with the cards either side of it and the culprit marked. One
+card of reaction time is forgiven, since you are pressing a key rather than
+reading a number.
+
+**A history of everything**, from the menu or the end-of-session screen. Every
+night in the casino, every drill run and every training shoe is written to local
+storage and plotted.
+
+One point on a graph is **one session**, not one day. Each record keeps the wall
+clock from when you walked in to when you walked out, so three sessions in an
+evening are three points with their own times, and the axis reads `28/8 16:12`
+rather than just `28/8`. Hovering gives you the whole span — *"30/8 00:12 → 00:56
+· 45 min"* — and the log lists when each one started and how long it lasted.
+Casino records keep both the wall-clock length and the time actually spent at a
+table, which is why the volume chart has two lines.
+
+Five tabs:
+
+- **Money** — bankroll session by session with the back-offs marked, cumulative
+  win and loss, result per session as bars, and your rate per hundred hands
+  against your average bet.
+- **Skill** — playing decisions, bet sizing, count checks and index plays as four
+  lines over time, so you can see which one is actually holding you back. Plus
+  volume per session, and your live-table shoes with recall and tagging split
+  apart.
+- **Heat** — peak heat per session against the back-off threshold, and the six
+  surveillance factors over time. Watching *bet tracks the count* climb session
+  after session is the clearest possible picture of a counter getting greedy.
+- **Training** — pick a drill and see its accuracy and speed over time; below it,
+  live-table volume, peeking, dealer speed and average miss.
+- **Log** — every record, newest first, scrollable.
+
+Every chart has a hover readout, so you can point at a session and get its
+numbers rather than squinting at the line.
 
 ## Controls
 
@@ -61,7 +149,7 @@ tray, true-count conversion, basic strategy, and the Illustrious 18 index plays.
 | `Y` / `N` | insurance |
 | `W` | sit the hand out (wong) |
 | `T` | tip the dealer |
-| `+` / `-` | adjust your own running count (Spotter mode) |
+| `+` / `-` | adjust your own running count (Spotter mode, and the live table drill) |
 | `C` / `Q` | co-op: call the count / open the callouts |
 | `ESC` | stand up / back |
 
@@ -110,9 +198,10 @@ src/
   heat/        the surveillance model
   world/       casino floor: collision, tables, features, wandering crowd
   net/         wire protocol, snapshot serialisation, WebSocket client
+  render/      cards and the chart primitives the history screen draws with
   table/       the controller seam: LocalTable (solo) and RemoteTable (co-op)
-  scenes/      menu, lobby, primer, floor, table, trainer, results, signals
-  state/       session, bankroll, stats
+  scenes/      menu, lobby, primer, floor, table, trainer, live table, results, history, signals
+  state/       session, bankroll, stats, saved history
 server/        room, hub, Vite dev plugin, standalone host
 scripts/       headless simulation harness
 ```

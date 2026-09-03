@@ -3,16 +3,29 @@ import { VH, VW } from "../core/renderer";
 import { C, button, fillRound, text, vignette, type Frame } from "../core/ui";
 import { drawCard, drawHand } from "../render/cards";
 import { RANKS, SUITS, cardValue, hiLo, type Card, type Rank } from "../blackjack/cards";
-import { mulberry32, pick, randInt, randomSeed, type Rng } from "../core/rng";
+import { mulberry32, pick, randInt, randomSeed, shuffle, type Rng } from "../core/rng";
 import { newHand, type Hand } from "../blackjack/hand";
 import { legalActions } from "../blackjack/hand";
 import { ACTION_LABEL, DEVIATIONS, basicStrategy, correctAction, type Action } from "../blackjack/strategy";
 import { TABLE_PRESETS } from "../blackjack/rules";
+import { TableSim } from "../blackjack/sim";
 import { floorTrueCount } from "../blackjack/counting";
 import { signed } from "../core/math";
 import { wrapText } from "./menu";
+import { LiveTableScene } from "./livetable";
 
-type DrillId = "menu" | "tags" | "speed" | "decks" | "truecount" | "strategy" | "index";
+type DrillId =
+  | "menu"
+  | "live"
+  | "tags"
+  | "pairs"
+  | "speed"
+  | "deckdown"
+  | "board"
+  | "decks"
+  | "truecount"
+  | "strategy"
+  | "index";
 
 const RULES = TABLE_PRESETS[0];
 
@@ -24,11 +37,35 @@ interface DrillInfo {
 }
 
 const DRILLS: DrillInfo[] = [
-  { id: "tags", name: "Card tags", blurb: "One card at a time. +1, 0 or −1. Build the reflex.", accent: C.green },
-  { id: "speed", name: "Count a deck", blurb: "Cards flash by. Keep the running count and call it at the end.", accent: C.blue },
-  { id: "decks", name: "Read the tray", blurb: "Estimate how many decks are in the discard tray.", accent: C.gold },
-  { id: "truecount", name: "True count", blurb: "Running count plus a tray. Convert, rounding toward zero.", accent: C.purple },
-  { id: "strategy", name: "Basic strategy", blurb: "Every hand, every upcard, until it is automatic.", accent: C.green },
+  {
+    id: "live",
+    name: "Live table",
+    blurb: "A real dealer and a real shoe. No betting, no decisions — just hold the count.",
+    accent: C.gold,
+  },
+  { id: "tags", name: "Card tags", blurb: "One card. +1, 0 or −1. Build the reflex.", accent: C.green },
+  {
+    id: "pairs",
+    name: "Cancel the pair",
+    blurb: "Two cards at once — call the net, do not add them one by one.",
+    accent: C.blue,
+  },
+  { id: "speed", name: "Count a deck", blurb: "Cards flash by. Hold the count, call it at the end.", accent: C.blue },
+  {
+    id: "deckdown",
+    name: "Count down a deck",
+    blurb: "One deck, last card face down. Name it from your count alone.",
+    accent: C.purple,
+  },
+  {
+    id: "board",
+    name: "Net the table",
+    blurb: "A settled table, every card face up. Scan it and call the net.",
+    accent: C.blue,
+  },
+  { id: "decks", name: "Read the tray", blurb: "Estimate the decks in the discard tray.", accent: C.gold },
+  { id: "truecount", name: "True count", blurb: "Running count over a tray. Convert toward zero.", accent: C.purple },
+  { id: "strategy", name: "Basic strategy", blurb: "Every hand, every upcard, until automatic.", accent: C.green },
   { id: "index", name: "Index plays", blurb: "The Illustrious 18 with a true count attached.", accent: C.heat },
 ];
 
@@ -43,7 +80,35 @@ export class TrainerScene implements Scene {
   private lastCorrect: boolean | null = null;
   private explain = "";
 
+  /** Wall clock when this drill run began. */
+  private drillStartedAt = 0;
+  /** When the current question went up, and how long recent answers took. */
+  private askedAt = 0;
+  private answerTimes: number[] = [];
+
+  // cancel-the-pair drill
+  private pairSize = 2;
+  private pairProgressive = true;
+  private pairCards: Card[] = [];
+  private pairAsked = 0;
+  private pairTimes: number[] = [];
+
+  // count-down-a-deck drill
+  private downCards: Card[] = [];
+  private downIndex = 0;
+  private downTimer = 0;
+  private downInterval = 0.6;
+  private downState: "setup" | "running" | "answer" | "result" = "setup";
+  private downElapsed = 0;
+
+  // net-the-table drill
+  private boardDealer: Card[] = [];
+  private boardHands: Card[][] = [];
+  private boardSeats = 4;
+  private boardTruth = 0;
+
   // speed drill
+  private speedPer = 1;
   private speedCards: Card[] = [];
   private speedIndex = 0;
   private speedTimer = 0;
@@ -98,28 +163,76 @@ export class TrainerScene implements Scene {
     }
   }
 
+  exit(): void {
+    this.flush();
+  }
+
+  /** Write the run just finished into the history, if there was one. */
+  private flush(): void {
+    if (this.drill === "menu" || this.score.total === 0) return;
+    const times = this.answerTimes;
+    const msPerAnswer = times.length ? times.reduce((a, b) => a + b, 0) / times.length : 0;
+    this.game.history.add({
+      kind: "drill",
+      at: Date.now(),
+      startedAt: this.drillStartedAt || Date.now(),
+      drill: this.drill,
+      right: this.score.right,
+      total: this.score.total,
+      bestStreak: this.score.best,
+      msPerAnswer,
+      ...(this.drill === "deckdown" && this.downElapsed > 0
+        ? { deckSeconds: this.downElapsed }
+        : {}),
+      ...(this.drill === "pairs" ? { groupSize: this.pairCards.length } : {}),
+      ...(this.drill === "speed" ? { cards: this.speedCount, perFlash: this.speedPer } : {}),
+    });
+  }
+
   private setDrill(id: DrillId): void {
+    if (id === "live") {
+      // Its own scene: it renders a whole table rather than a single prompt.
+      this.game.setScene(new LiveTableScene(this.game, () => this.game.setScene(this)));
+      return;
+    }
+    this.flush();
     this.drill = id;
     this.score = { right: 0, total: 0, streak: 0, best: 0 };
     this.lastCorrect = null;
     this.explain = "";
     this.answerT = 0;
+    this.answerTimes = [];
+    this.askedAt = 0;
+    this.drillStartedAt = Date.now();
     this.speedState = "setup";
     this.next();
   }
 
   private menu(f: Frame): void {
     this.header(f, "Training room", "No money, no pit boss. Just repetitions.");
+    const cols = 4;
+    const cw = (VW - 120 - (cols - 1) * 14) / cols;
     DRILLS.forEach((d, i) => {
-      const col = i % 3;
-      const row = Math.floor(i / 3);
-      const r = { x: 60 + col * 390, y: 150 + row * 200, w: 360, h: 170 };
+      const col = i % cols;
+      const row = Math.floor(i / cols);
+      const r = { x: 60 + col * (cw + 14), y: 130 + row * 168, w: cw, h: 146 };
       const hover = f.mx >= r.x && f.mx <= r.x + r.w && f.my >= r.y && f.my <= r.y + r.h;
       fillRound(f.ctx, r, 12, hover ? C.panelHi : C.panel, hover ? d.accent : C.line, hover ? 2 : 1);
-      text(f.ctx, d.name, r.x + 22, r.y + 44, { size: 22, weight: "700", color: d.accent });
-      wrapText(f.ctx, d.blurb, r.x + 22, r.y + 76, r.w - 44, 20, { size: 14, color: C.dim });
-      text(f.ctx, `${i + 1}`, r.x + r.w - 22, r.y + 40, { size: 14, color: C.faint, align: "right", weight: "700" });
-      if ((hover && f.clicked) || f.input.consume(String(i + 1))) this.setDrill(d.id);
+      wrapText(f.ctx, d.name, r.x + 18, r.y + 38, r.w - 46, 24, {
+        size: 20,
+        weight: "700",
+        color: d.accent,
+      });
+      wrapText(f.ctx, d.blurb, r.x + 18, r.y + 74, r.w - 36, 19, { size: 13, color: C.dim });
+      // Keys 1-9 then 0 for the tenth.
+      const key = i < 9 ? String(i + 1) : "0";
+      text(f.ctx, key, r.x + r.w - 18, r.y + 34, {
+        size: 14,
+        color: C.faint,
+        align: "right",
+        weight: "700",
+      });
+      if ((hover && f.clicked) || f.input.consume(key)) this.setDrill(d.id);
     });
   }
 
@@ -127,7 +240,59 @@ export class TrainerScene implements Scene {
     return { rank: pick(RANKS, this.rng), suit: pick(SUITS, this.rng), id: Math.floor(this.rng() * 1e9) };
   }
 
+  /**
+   * A card that does not look like the one before it. Repeats read as a glitch
+   * and a repeated rank lets you coast on the previous tag instead of reading
+   * the new card, so both are avoided where possible.
+   */
+  private nextDistinctCard(prev: Card | null): Card {
+    if (!prev) return this.randomCard();
+    for (let i = 0; i < 40; i++) {
+      const c = this.randomCard();
+      if (c.rank !== prev.rank && c.suit !== prev.suit) return c;
+    }
+    let c = this.randomCard();
+    while (c.rank === prev.rank && c.suit === prev.suit) c = this.randomCard();
+    return c;
+  }
+
+  /**
+   * A run of cards dealt off real decks rather than drawn with replacement, so
+   * no card can come round twice in a row, and never two of the same rank or
+   * suit back to back while the shoe still has an alternative.
+   */
+  private buildRun(count: number): Card[] {
+    const decks = Math.max(2, Math.ceil(count / 40));
+    const pool: Card[] = [];
+    let id = 0;
+    for (let d = 0; d < decks; d++) {
+      for (const s of SUITS) for (const r of RANKS) pool.push({ rank: r, suit: s, id: id++ });
+    }
+    shuffle(pool, this.rng);
+
+    const out: Card[] = [];
+    let prev: Card | null = null;
+    for (let i = 0; i < count && pool.length > 0; i++) {
+      let at = 0;
+      if (prev) {
+        const last = prev;
+        // The pool is shuffled, so the first card matching a rule is a random one.
+        at = pool.findIndex((c) => c.rank !== last.rank && c.suit !== last.suit);
+        if (at < 0) at = pool.findIndex((c) => c.rank !== last.rank);
+        if (at < 0) at = pool.findIndex((c) => c.suit !== last.suit);
+        if (at < 0) at = 0;
+      }
+      prev = pool.splice(at, 1)[0];
+      out.push(prev);
+    }
+    return out;
+  }
+
   private mark(correct: boolean, explain = ""): void {
+    if (this.askedAt > 0) {
+      this.answerTimes.push(performance.now() - this.askedAt);
+      if (this.answerTimes.length > 40) this.answerTimes.shift();
+    }
     this.score.total++;
     if (correct) {
       this.score.right++;
@@ -144,9 +309,10 @@ export class TrainerScene implements Scene {
   private next(): void {
     this.lastCorrect = null;
     this.explain = "";
+    this.askedAt = performance.now();
     switch (this.drill) {
       case "tags":
-        this.card = this.randomCard();
+        this.card = this.nextDistinctCard(this.card);
         break;
       case "decks":
         this.trayDecks = randInt(this.rng, 2, 20) / 4;
@@ -166,9 +332,38 @@ export class TrainerScene implements Scene {
       case "speed":
         this.speedState = "setup";
         break;
+      case "pairs": {
+        const size = this.pairProgressive
+          ? Math.min(4, 2 + Math.floor(this.score.streak / 8))
+          : this.pairSize;
+        this.pairCards = this.buildGroup(size);
+        this.pairAsked = performance.now();
+        break;
+      }
+      case "deckdown":
+        this.downState = "setup";
+        break;
+      case "board":
+        this.dealBoard();
+        break;
       default:
         break;
     }
+  }
+
+  /** A short run of cards, none of them looking like their neighbour. */
+  private buildGroup(n: number): Card[] {
+    const out: Card[] = [];
+    let prev: Card | null = null;
+    for (let i = 0; i < n; i++) {
+      prev = this.nextDistinctCard(prev);
+      out.push(prev);
+    }
+    return out;
+  }
+
+  private tagsOf(cards: Card[]): number {
+    return cards.reduce((a, c) => a + hiLo(c.rank), 0);
   }
 
   // ------------------------------------------------------------- the drills
@@ -187,12 +382,364 @@ export class TrainerScene implements Scene {
       case "truecount":
         this.trueCountDrill(f);
         break;
+      case "pairs":
+        this.pairDrill(f);
+        break;
+      case "deckdown":
+        this.deckDownDrill(f);
+        break;
+      case "board":
+        this.boardDrill(f);
+        break;
       case "strategy":
       case "index":
         this.strategyDrill(f);
         break;
       default:
         break;
+    }
+  }
+
+  // ------------------------------------------------------- cancel the pair
+
+  private pairDrill(f: Frame): void {
+    const { ctx } = f;
+    const size = this.pairCards.length || 2;
+    const avg = this.pairTimes.length
+      ? this.pairTimes.reduce((a, b) => a + b, 0) / this.pairTimes.length
+      : 0;
+    this.header(
+      f,
+      "Cancel the pair",
+      "Read the group as one number. A five and a king are nothing — do not add them one at a time.",
+    );
+
+    if (avg > 0) {
+      text(ctx, `${(avg / 1000).toFixed(2)}s a group`, VW - 60, 92, {
+        size: 13,
+        color: C.faint,
+        align: "right",
+        mono: true,
+      });
+    }
+
+    // Group size controls.
+    const sizes = [2, 3, 4];
+    sizes.forEach((n, i) => {
+      const r = { x: 60 + i * 62, y: 118, w: 56, h: 34 };
+      if (
+        button(f, r, String(n), {
+          small: true,
+          accent: C.blue,
+          active: !this.pairProgressive && this.pairSize === n,
+        })
+      ) {
+        this.pairProgressive = false;
+        this.pairSize = n;
+        this.next();
+      }
+    });
+    if (
+      button(f, { x: 250, y: 118, w: 150, h: 34 }, "Progressive", {
+        small: true,
+        accent: C.gold,
+        active: this.pairProgressive,
+      })
+    ) {
+      this.pairProgressive = true;
+      this.next();
+    }
+    if (this.pairProgressive) {
+      text(ctx, `grows with your streak — ${size} at a time now`, 416, 140, {
+        size: 12,
+        color: C.faint,
+      });
+    }
+
+    // The group.
+    const cw = 96;
+    const gap = 14;
+    const totalW = size * cw + (size - 1) * gap;
+    const startX = VW / 2 - totalW / 2;
+    this.pairCards.forEach((c, i) => {
+      drawCard(ctx, c, startX + i * (cw + gap), 186, cw, cw * 1.42);
+    });
+
+    // Answer buttons: every net the group can produce.
+    const nets: number[] = [];
+    for (let v = -size; v <= size; v++) nets.push(v);
+    const bw = Math.min(96, (VW - 240) / nets.length - 10);
+    const rowW = nets.length * (bw + 10) - 10;
+    let picked: number | null = null;
+    nets.forEach((v, i) => {
+      const r = { x: VW / 2 - rowW / 2 + i * (bw + 10), y: 424, w: bw, h: 62 };
+      const label = v > 0 ? `+${v}` : String(v);
+      const hot = String(i + 1);
+      if (
+        button(f, r, label, {
+          accent: v > 0 ? C.green : v < 0 ? C.red : C.dim,
+          hotkey: hot,
+        })
+      ) {
+        picked = v;
+      }
+      if (f.input.consume(hot)) picked = v;
+    });
+
+    if (this.answerT > 0) {
+      this.answerT -= f.dt;
+      this.drawVerdict(f, 534);
+      if (this.answerT <= 0) this.next();
+      return;
+    }
+    if (picked !== null) {
+      const truth = this.tagsOf(this.pairCards);
+      this.pairTimes.push(performance.now() - this.pairAsked);
+      if (this.pairTimes.length > 20) this.pairTimes.shift();
+      const parts = this.pairCards
+        .map((c) => {
+          const t = hiLo(c.rank);
+          return `${c.rank === "T" ? "10" : c.rank} ${t > 0 ? "+1" : t < 0 ? "−1" : "0"}`;
+        })
+        .join("   ");
+      this.mark(picked === truth, `${parts}   →   ${signed(truth)}`);
+    }
+  }
+
+  // ----------------------------------------------------- count down a deck
+
+  private deckDownDrill(f: Frame): void {
+    const { ctx } = f;
+    this.header(
+      f,
+      "Count down a deck",
+      "One deck, dealt out bar the last card. A whole deck sums to zero, so your count names the card you cannot see.",
+    );
+
+    if (this.downState === "setup") {
+      text(ctx, "Seconds per card", 300, 226, { size: 14, color: C.faint });
+      text(ctx, this.downInterval.toFixed(2), 300, 266, { size: 34, weight: "800", mono: true });
+      if (button(f, { x: 440, y: 232, w: 46, h: 40 }, "−"))
+        this.downInterval = Math.max(0.1, +(this.downInterval - 0.05).toFixed(2));
+      if (button(f, { x: 494, y: 232, w: 46, h: 40 }, "+"))
+        this.downInterval = Math.min(2, +(this.downInterval + 0.05).toFixed(2));
+      text(
+        ctx,
+        "Under thirty seconds for the deck is the benchmark counters aim at.",
+        300,
+        320,
+        { size: 13, color: C.faint },
+      );
+      if (
+        button(f, { x: 300, y: 380, w: 240, h: 60 }, "Deal", { accent: C.green, hotkey: "SPACE" }) ||
+        f.input.consume(" ", "Enter")
+      ) {
+        this.downCards = this.buildDeck();
+        this.downIndex = 0;
+        this.downTimer = 0;
+        this.downElapsed = 0;
+        this.downState = "running";
+      }
+      return;
+    }
+
+    if (this.downState === "running") {
+      this.downTimer -= f.dt;
+      this.downElapsed += f.dt;
+      if (this.downTimer <= 0) {
+        this.downIndex++;
+        this.downTimer = this.downInterval;
+      }
+      // The last card is never shown -- it is the answer.
+      if (this.downIndex >= this.downCards.length - 1) {
+        this.downState = "answer";
+        return;
+      }
+      drawCard(ctx, this.downCards[this.downIndex], VW / 2 - 70, 190, 140, 198);
+      text(ctx, `${this.downIndex + 1} / ${this.downCards.length - 1}`, VW / 2, 430, {
+        size: 15,
+        color: C.faint,
+        align: "center",
+        mono: true,
+      });
+      text(ctx, `${this.downElapsed.toFixed(1)}s`, VW / 2, 452, {
+        size: 13,
+        color: C.dim,
+        align: "center",
+        mono: true,
+      });
+      const w = 600 * (this.downIndex / (this.downCards.length - 1));
+      fillRound(ctx, { x: VW / 2 - 300, y: 466, w: 600, h: 6 }, 3, "#182029");
+      fillRound(ctx, { x: VW / 2 - 300, y: 466, w, h: 6 }, 3, C.purple);
+      return;
+    }
+
+    const last = this.downCards[this.downCards.length - 1];
+    const truth = hiLo(last.rank);
+
+    if (this.downState === "answer") {
+      text(ctx, "What is the last card?", VW / 2, 230, {
+        size: 26,
+        align: "center",
+        weight: "700",
+      });
+      text(
+        ctx,
+        `You counted ${this.downCards.length - 1} cards in ${this.downElapsed.toFixed(1)}s. Your count is the negative of the card left face down.`,
+        VW / 2,
+        258,
+        { size: 13, align: "center", color: C.faint },
+      );
+      drawCard(ctx, null, VW / 2 - 50, 280, 100, 142, { faceDown: true });
+      const opts: { label: string; value: number; accent: string; key: string }[] = [
+        { label: "Low  2–6", value: 1, accent: C.green, key: "1" },
+        { label: "Neutral  7–9", value: 0, accent: C.dim, key: "2" },
+        { label: "High  10–A", value: -1, accent: C.red, key: "3" },
+      ];
+      let picked: number | null = null;
+      opts.forEach((o, i) => {
+        const r = { x: VW / 2 - 300 + i * 204, y: 452, w: 192, h: 66 };
+        if (button(f, r, o.label, { accent: o.accent, hotkey: o.key })) picked = o.value;
+        if (f.input.consume(o.key)) picked = o.value;
+      });
+      if (picked !== null) {
+        this.mark(
+          picked === truth,
+          `It was the ${last.rank === "T" ? "10" : last.rank} of ${suitName(last.suit)} — ${signed(truth)}.`,
+        );
+        this.downState = "result";
+      }
+      return;
+    }
+
+    // result
+    drawCard(ctx, last, VW / 2 - 60, 210, 120, 170);
+    this.drawVerdict(f, 424);
+    text(
+      ctx,
+      `Your count through the other ${this.downCards.length - 1} cards must have been ${signed(-truth)}.`,
+      VW / 2,
+      478,
+      { size: 14, align: "center", color: C.dim },
+    );
+    if (
+      button(f, { x: VW / 2 - 110, y: 504, w: 220, h: 52 }, "Again", {
+        accent: C.green,
+        hotkey: "SPACE",
+      }) ||
+      f.input.consume(" ", "Enter")
+    ) {
+      this.downState = "setup";
+    }
+  }
+
+  /** One genuine 52-card deck, so the tags really do sum to zero. */
+  private buildDeck(): Card[] {
+    const pool: Card[] = [];
+    let id = 0;
+    for (const s of SUITS) for (const r of RANKS) pool.push({ rank: r, suit: s, id: id++ });
+    shuffle(pool, this.rng);
+    return pool;
+  }
+
+  // -------------------------------------------------------- net the table
+
+  private dealBoard(): void {
+    const rules = { ...RULES, seats: this.boardSeats, dealSpeed: 0.01 };
+    const sim = new TableSim(rules, this.rng, {});
+    sim.seats.forEach((s, i) => {
+      s.kind = "npc";
+      s.name = `Seat ${i + 1}`;
+      s.playerId = null;
+      s.chips = 1e7;
+      s.npc = { skill: 0.9, aggression: 1, superstition: 0.2 };
+    });
+    let guard = 0;
+    while (guard++ < 4000) {
+      sim.update(0.5);
+      if (sim.phase === "settle" && !sim.dealer.holeHidden) break;
+    }
+    this.boardDealer = sim.dealer.cards.slice();
+    this.boardHands = sim.seats
+      .filter((s) => s.hands.length > 0)
+      .map((s) => s.hands.flatMap((h) => h.cards));
+    this.boardTruth =
+      this.tagsOf(this.boardDealer) + this.boardHands.reduce((a, h) => a + this.tagsOf(h), 0);
+    this.entry = 0;
+  }
+
+  private boardDrill(f: Frame): void {
+    const { ctx } = f;
+    this.header(
+      f,
+      "Net the table",
+      "The hand is over and every card is face up. Sweep it and call the net before the dealer clears it.",
+    );
+
+    const seats = [3, 4, 5, 6];
+    seats.forEach((n, i) => {
+      const r = { x: 60 + i * 62, y: 118, w: 56, h: 34 };
+      if (button(f, r, String(n), { small: true, accent: C.blue, active: this.boardSeats === n })) {
+        this.boardSeats = n;
+        this.next();
+      }
+    });
+    text(ctx, "seats", 60 + seats.length * 62 + 8, 140, { size: 12, color: C.faint });
+
+    // Dealer, then the hands in a row.
+    const dw = (this.boardDealer.length - 1) * 26 + 54;
+    drawHand(ctx, this.boardDealer, VW / 2 - dw / 2, 168, { scale: 0.86, overlap: 26 });
+    text(ctx, "DEALER", VW / 2, 168 + 88 + 14, {
+      size: 10,
+      color: C.faint,
+      align: "center",
+      weight: "700",
+    });
+
+    const n = this.boardHands.length;
+    const slot = Math.min(220, (VW - 160) / Math.max(1, n));
+    this.boardHands.forEach((hand, i) => {
+      const cx = VW / 2 - (n * slot) / 2 + slot * i + slot / 2;
+      const hw = (hand.length - 1) * 22 + 46;
+      drawHand(ctx, hand, cx - hw / 2, 306, { scale: 0.74, overlap: 22 });
+      if (this.answerT > 0) {
+        const net = this.tagsOf(hand);
+        text(ctx, signed(net), cx, 306 + 78, {
+          size: 15,
+          weight: "800",
+          align: "center",
+          color: net > 0 ? C.green : net < 0 ? C.red : C.faint,
+        });
+      }
+    });
+    if (this.answerT > 0) {
+      const dn = this.tagsOf(this.boardDealer);
+      text(ctx, signed(dn), VW / 2 + dw / 2 + 24, 168 + 44, {
+        size: 15,
+        weight: "800",
+        color: dn > 0 ? C.green : dn < 0 ? C.red : C.faint,
+      });
+    }
+
+    text(ctx, "Net", 480, 452, { size: 14, color: C.faint });
+    fillRound(ctx, { x: 480, y: 464, w: 150, h: 58 }, 8, "#0a0f14", C.line);
+    text(ctx, signed(this.entry), 555, 502, { size: 32, weight: "800", mono: true, align: "center" });
+    if (button(f, { x: 646, y: 468, w: 56, h: 50 }, "−")) this.entry--;
+    if (button(f, { x: 710, y: 468, w: 56, h: 50 }, "+")) this.entry++;
+    if (f.input.consume("arrowdown", "arrowleft", "-")) this.entry--;
+    if (f.input.consume("arrowup", "arrowright", "+", "=")) this.entry++;
+
+    if (this.answerT > 0) {
+      this.answerT -= f.dt;
+      this.drawVerdict(f, 566);
+      if (this.answerT <= 0) this.next();
+      return;
+    }
+    if (
+      button(f, { x: 790, y: 468, w: 150, h: 50 }, "Call it", { accent: C.gold, hotkey: "ENTER" }) ||
+      f.input.consume("Enter", " ")
+    ) {
+      this.mark(this.entry === this.boardTruth, `The felt was worth ${signed(this.boardTruth)}.`);
     }
   }
 
@@ -244,14 +791,31 @@ export class TrainerScene implements Scene {
       if (button(f, { x: 814, y: 246, w: 46, h: 40 }, "+"))
         this.speedInterval = Math.min(2, +(this.speedInterval + 0.1).toFixed(2));
 
-      text(ctx, "A dealer at a full table puts out about one card every 0.6 seconds.", 300, 340, {
+      text(ctx, "Cards at a time", 300, 350, { size: 14, color: C.faint });
+      [1, 2, 3].forEach((n, i) => {
+        const r = { x: 300 + i * 62, y: 362, w: 56, h: 40 };
+        if (button(f, r, String(n), { small: true, accent: C.blue, active: this.speedPer === n })) {
+          this.speedPer = n;
+        }
+      });
+      text(
+        ctx,
+        this.speedPer === 1
+          ? "One at a time. Tag, add, hold."
+          : "Read the group as one number instead of adding it card by card.",
+        500,
+        388,
+        { size: 13, color: C.faint },
+      );
+
+      text(ctx, "A dealer at a full table puts out about one card every 0.6 seconds.", 300, 440, {
         size: 13,
         color: C.faint,
       });
 
-      if (button(f, { x: 300, y: 400, w: 240, h: 60 }, "Start", { accent: C.green, hotkey: "SPACE" }) ||
+      if (button(f, { x: 300, y: 470, w: 240, h: 60 }, "Start", { accent: C.green, hotkey: "SPACE" }) ||
         f.input.consume(" ", "Enter")) {
-        this.speedCards = Array.from({ length: this.speedCount }, () => this.randomCard());
+        this.speedCards = this.buildRun(this.speedCount);
         this.runningTruth = this.speedCards.reduce((a, c) => a + hiLo(c.rank), 0);
         this.speedIndex = 0;
         this.speedTimer = 0;
@@ -262,23 +826,31 @@ export class TrainerScene implements Scene {
     }
 
     if (this.speedState === "running") {
+      const per = this.speedPer;
       this.speedTimer -= f.dt;
       if (this.speedTimer <= 0) {
-        this.speedIndex++;
-        this.speedTimer = this.speedInterval;
+        this.speedIndex += per;
+        // A group of two takes a little longer than a single card, not double.
+        this.speedTimer = this.speedInterval * (1 + (per - 1) * 0.7);
       }
       if (this.speedIndex >= this.speedCards.length) {
         this.speedState = "answer";
         return;
       }
-      const c = this.speedCards[this.speedIndex];
-      drawCard(ctx, c, VW / 2 - 70, 190, 140, 198);
-      text(ctx, `${this.speedIndex + 1} / ${this.speedCards.length}`, VW / 2, 430, {
-        size: 15,
-        color: C.faint,
-        align: "center",
-        mono: true,
+      const group = this.speedCards.slice(this.speedIndex, this.speedIndex + per);
+      const cw = per === 1 ? 140 : per === 2 ? 120 : 104;
+      const gap = 16;
+      const totalW = group.length * cw + (group.length - 1) * gap;
+      group.forEach((c, i) => {
+        drawCard(ctx, c, VW / 2 - totalW / 2 + i * (cw + gap), 190, cw, cw * 1.42);
       });
+      text(
+        ctx,
+        `${Math.min(this.speedIndex + per, this.speedCards.length)} / ${this.speedCards.length}`,
+        VW / 2,
+        430,
+        { size: 15, color: C.faint, align: "center", mono: true },
+      );
       const w = 600 * (this.speedIndex / this.speedCards.length);
       fillRound(ctx, { x: VW / 2 - 300, y: 452, w: 600, h: 6 }, 3, "#182029");
       fillRound(ctx, { x: VW / 2 - 300, y: 452, w, h: 6 }, 3, C.blue);
@@ -548,4 +1120,8 @@ function buildTotal(total: number, rng: Rng): Card[] {
     { rank: "T", suit: "S", id: 2 },
     { rank: String(Math.max(2, Math.min(10, total - 10))) as Rank, suit: "H", id: 3 },
   ];
+}
+
+function suitName(s: Card["suit"]): string {
+  return s === "S" ? "spades" : s === "H" ? "hearts" : s === "D" ? "diamonds" : "clubs";
 }

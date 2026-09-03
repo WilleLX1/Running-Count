@@ -7,6 +7,7 @@ import { FloorScene } from "./floor";
 import { TrainerScene } from "./trainer";
 import { PrimerScene } from "./primer";
 import { LobbyScene } from "./lobby";
+import { HistoryScene } from "./history";
 
 const STAKES: { label: string; bankroll: number; unit: number }[] = [
   { label: "Tourist", bankroll: 1000, unit: 10 },
@@ -129,9 +130,21 @@ export class MenuScene implements Scene {
       this.game.setScene(floor);
       return;
     }
-    const coopR = { x: 120, y: 626, w: 520, h: 54 };
-    if (button(f, coopR, "Play co-op with friends", { accent: C.gold, hotkey: "C" }) || f.input.consume("c")) {
+    const coopR = { x: 120, y: 626, w: 256, h: 54 };
+    if (button(f, coopR, "Play co-op", { accent: C.gold, hotkey: "C" }) || f.input.consume("c")) {
       this.game.setScene(new LobbyScene(this.game));
+      return;
+    }
+    const histR = { x: 384, y: 626, w: 256, h: 54 };
+    const runs = this.game.history.records.length;
+    if (
+      button(f, histR, runs > 0 ? `Your history (${runs})` : "Your history", {
+        accent: C.purple,
+        hotkey: "Y",
+      }) ||
+      f.input.consume("y")
+    ) {
+      this.game.setScene(new HistoryScene(this.game, () => this.game.setScene(new MenuScene(this.game))));
       return;
     }
     const trainR = { x: 664, y: 552, w: 496, h: 62 };

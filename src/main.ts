@@ -9,6 +9,7 @@ const renderer = new Renderer(canvas);
 const input = new Input(canvas);
 const game = new Game();
 game.session.load();
+game.history.load();
 game.setScene(new MenuScene(game));
 
 if (import.meta.env.DEV) {

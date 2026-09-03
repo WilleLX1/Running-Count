@@ -139,6 +139,7 @@ export class TableScene implements Scene {
     if (!modal) {
       this.controller.update(dt);
       if (!net) session.surveillance.update(dt, true);
+      if (!net) session.noteHeat(session.surveillance.suspicion);
     }
     if (net) {
       const me = net.me;
